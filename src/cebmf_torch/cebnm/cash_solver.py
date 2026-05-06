@@ -84,7 +84,17 @@ def pen_loglik_loss(pred_pi, marginal_log_lik, penalty=1.5, epsilon=1e-10):
 
 
 class cash_PosteriorMeanNorm:
-    def __init__(self, post_mean, post_mean2, post_sd, pi_np, scale, loss=0, model_param=None):
+    def __init__(
+        self,
+        post_mean,
+        post_mean2,
+        post_sd,
+        pi_np,
+        scale,
+        loss=0,
+        model_param=None,
+        priors_fitted=None,
+    ):
         """
         Container for the results of the CASH posterior mean estimation.
 
@@ -104,6 +114,12 @@ class cash_PosteriorMeanNorm:
             Final training loss or log-likelihood.
         model_param : dict, optional
             Trained model parameters (state_dict).
+        priors_fitted : dict or None, optional
+            Fitted Level-2 hyperparameters keyed by categorical column
+            (Step 3: integer keys, e.g.
+            ``{0: {"tau2": 0.42, "solver": "normal"}}``). ``None`` when no
+            Level-2 prior was active. Step 4 will move to string keys via
+            the typed feature API.
         """
         self.post_mean = post_mean
         self.post_mean2 = post_mean2
@@ -112,6 +128,7 @@ class cash_PosteriorMeanNorm:
         self.loss = loss
         self.scale = scale
         self.model_param = model_param
+        self.priors_fitted = priors_fitted
 
 
 # Class to store the results

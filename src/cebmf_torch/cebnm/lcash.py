@@ -14,6 +14,7 @@ reference-category gauge (row 0 of every embedding pinned at zero), enforced
 by a backward hook installed via ``_install_reference_gauge``.
 """
 
+import math
 import warnings
 
 import torch
@@ -281,6 +282,40 @@ def _install_reference_gauge(net: nn.Module) -> None:
 
 
 # ============================================================
+# Level-2 prior helpers (Step 3)
+# ============================================================
+
+
+def fit_normal(coeffs: torch.Tensor, tau2_min: float = 1e-6) -> dict:
+    """Level-2 fitter for the Normal prior.
+
+    Calls :func:`cebmf_torch.ebnm.ebnm_normal` with ``sebetahat=None``
+    (zero-SE / MAP-II) on the given coefficients and returns the
+    fitted hyperparameter ``{"tau2": tau2}``.
+
+    The clamp ``tau2_min`` is forwarded to ``ebnm_normal`` so that the
+    returned ``tau2`` is the floor-respecting marginal-ML estimate
+    (Section 5.3 of the design doc; default ``1e-6`` prevents the
+    degenerate sink at ``tau2 = 0``).
+    """
+    from cebmf_torch.ebnm import ebnm_normal
+
+    res = ebnm_normal(coeffs, sebetahat=None, tau2_min=tau2_min)
+    return {"tau2": res.tau2}
+
+
+def logp_normal(theta: torch.Tensor, psi: dict) -> torch.Tensor:
+    """Differentiable log-density of g = N(0, tau2), summed over theta entries.
+
+    Returns a scalar Tensor with autograd flowing through ``theta``.
+    ``psi["tau2"]`` is treated as a Python float / detached constant
+    (no grad through the M-step).
+    """
+    tau2 = psi["tau2"]
+    return -0.5 * (theta.pow(2) / tau2 + math.log(2 * math.pi * tau2)).sum()
+
+
+# ============================================================
 # Shared helpers
 # ============================================================
 
@@ -492,6 +527,38 @@ def _select_grid(
     return scale, None
 
 
+def _normalise_cat_prior(
+    cat_prior: str | list[str | None] | None,
+    n_cat_cols: int,
+) -> list[str | None] | None:
+    """Promote a scalar ``cat_prior`` to a length-``n_cat_cols`` list.
+
+    Returns ``None`` (no Level-2 prior anywhere) or a list of strings/Nones
+    of length ``n_cat_cols``. Validates that any non-None entry is one of
+    the supported solvers; Step 3 only supports ``"normal"``.
+    """
+    if cat_prior is None:
+        return None
+    if n_cat_cols == 0:
+        raise ValueError("cat_prior was given but X_cat is None / has no columns.")
+    if isinstance(cat_prior, str):
+        cat_prior = [cat_prior] * n_cat_cols
+    else:
+        cat_prior = list(cat_prior)
+    if len(cat_prior) != n_cat_cols:
+        raise ValueError(f"cat_prior has length {len(cat_prior)} but X_cat has {n_cat_cols} columns.")
+    for d, p in enumerate(cat_prior):
+        if p is None:
+            continue
+        if p != "normal":
+            raise ValueError(
+                f"cat_prior[{d}]={p!r}: only 'normal' is currently supported; see Step 5 for additional solvers."
+            )
+    if all(p is None for p in cat_prior):
+        return None
+    return cat_prior
+
+
 def _train_model(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
@@ -506,14 +573,32 @@ def _train_model(
     verbose: bool,
     label: str,
     seed: int = 42,
-) -> float:
-    """Run the training loop. Returns the final-epoch total loss.
+    cat_prior: list[str | None] | None = None,
+    prior_warmup_epochs: int = 20,
+    prior_refit_every: int = 10,
+    tau2_min: float = 1e-6,
+) -> tuple[float, dict]:
+    """Run the training loop. Returns ``(final_epoch_loss, priors_state)``.
 
     Pre-computes the (G, K) log-likelihood matrix once rather than
     recomputing per mini-batch (logL is constant during training).
     Batch ordering is seeded for reproducibility via a ``DataLoader`` over
     a ``TensorDataset`` that keeps continuous, categorical and outcome
     tensors aligned.
+
+    When ``cat_prior`` is non-None, runs an outer alternating M/E loop
+    (Section 6.1, 11.2 of the design doc):
+
+    - **M-step**: gradient descent for ``prior_refit_every`` epochs, with
+      the cached ``priors_state`` contributing a Level-2 regulariser
+      ``(|B|/N) * R_d`` per minibatch (Section 6.7) once warm-up is over.
+    - **E-step**: refit the Level-2 prior by calling :func:`fit_normal`
+      on ``model.cat[d].weight[1:].detach().flatten()`` (row 0 excluded
+      per the gauge, Section 6.5).
+
+    During warm-up (``epochs_done < prior_warmup_epochs``) the prior
+    contribution is zero. ``priors_state`` is empty until the first
+    E-step, which fires after the first warm-up-completing M-step.
     """
     model.train()
     if X_scaled is not None:
@@ -522,6 +607,7 @@ def _train_model(
     else:
         device = X_cat.device
         n = X_cat.shape[0]
+    n_total = n  # |B|/N scaling: N is the size of the training set.
 
     # Pre-compute log-likelihood matrix (constant during training).
     loc = torch.zeros_like(scale)
@@ -543,25 +629,82 @@ def _train_model(
     loader = DataLoader(index_ds, batch_size=batch_size, shuffle=True, generator=g)
 
     n_batches = max(1, len(loader))
+    priors_state: dict[int, dict] = {}
+
+    # Outer alternating loop. When cat_prior is None, n_outer == 1 and
+    # epochs_this_iter == n_epochs, so we recover the original loop.
+    if cat_prior is None:
+        n_outer = 1
+    else:
+        n_outer = math.ceil(n_epochs / prior_refit_every) if n_epochs > 0 else 0
 
     final_epoch_loss = 0.0
-    for epoch in range(n_epochs):
-        epoch_loss = 0.0
-        for (idx,) in loader:
-            idx = idx.to(device)
-            x_cont_b = X_scaled[idx] if X_scaled is not None else None
-            x_cat_b = X_cat[idx] if X_cat is not None else None
-            pi_pred = model(x_cont_b, x_cat_b)
-            loss = pen_loglik_loss(pi_pred, logL_all[idx], penalty=penalty)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            epoch_loss += loss.item()
-        final_epoch_loss = epoch_loss
-        if verbose and (epoch + 1) % 50 == 0:
-            print(f"[{label}] Epoch {epoch + 1}/{n_epochs} | Loss: {epoch_loss / n_batches:.4f}")
+    for outer_iter in range(n_outer):
+        if cat_prior is None:
+            epochs_done = 0
+            epochs_this_iter = n_epochs
+        else:
+            epochs_done = outer_iter * prior_refit_every
+            epochs_this_iter = min(prior_refit_every, n_epochs - epochs_done)
+            if epochs_this_iter <= 0:
+                break
 
-    return final_epoch_loss
+        # ----- M-step: gradient descent on theta with current psi -----
+        for epoch in range(epochs_this_iter):
+            global_epoch = epochs_done + epoch
+            apply_prior = cat_prior is not None and global_epoch >= prior_warmup_epochs and len(priors_state) > 0
+
+            epoch_loss = 0.0
+            for (idx,) in loader:
+                idx = idx.to(device)
+                x_cont_b = X_scaled[idx] if X_scaled is not None else None
+                x_cat_b = X_cat[idx] if X_cat is not None else None
+                pi_pred = model(x_cont_b, x_cat_b)
+                loss = pen_loglik_loss(pi_pred, logL_all[idx], penalty=penalty)
+                if apply_prior:
+                    batch_size_actual = idx.shape[0]
+                    scale_factor = batch_size_actual / n_total
+                    for d, prior_name in enumerate(cat_prior):
+                        if prior_name is None or d not in priors_state:
+                            continue
+                        psi = priors_state[d]
+                        # Row 0 is gauge-pinned and excluded from the regulariser
+                        # (Section 6.5). Slice with grad-flow.
+                        coeffs = model.cat[d].weight[1:]
+                        if prior_name == "normal":
+                            R = -logp_normal(coeffs, psi)
+                        else:
+                            # _normalise_cat_prior should have caught this.
+                            raise ValueError(f"Unsupported Level-2 solver: {prior_name!r}")
+                        loss = loss + scale_factor * R
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                epoch_loss += loss.item()
+
+            final_epoch_loss = epoch_loss
+            if verbose and (global_epoch + 1) % 50 == 0:
+                print(f"[{label}] Epoch {global_epoch + 1}/{n_epochs} | Loss: {epoch_loss / n_batches:.4f}")
+
+        # ----- E-step: refit priors if we are past warm-up -----
+        if cat_prior is None:
+            continue
+        epochs_completed = epochs_done + epochs_this_iter
+        if epochs_completed >= prior_warmup_epochs:
+            for d, prior_name in enumerate(cat_prior):
+                if prior_name is None:
+                    continue
+                # Detach and flatten over rows 1..T_d-1 (and across all K
+                # output classes for LcashNet, or the single scalar column
+                # for PropOddsLcashNet -- both shapes flatten the same way).
+                coeffs = model.cat[d].weight[1:].detach().flatten()
+                if prior_name == "normal":
+                    psi = fit_normal(coeffs, tau2_min=tau2_min)
+                else:
+                    raise ValueError(f"Unsupported Level-2 solver: {prior_name!r}")
+                priors_state[d] = psi
+
+    return final_epoch_loss, priors_state
 
 
 def _compute_posteriors(
@@ -690,7 +833,7 @@ def _fit_lcash(
     n_epochs: int = 200,
     batch_size: int = 512,
     lr: float = 1e-3,
-    weight_decay: float = 1e-3,
+    weight_decay: float | None = None,
     penalty: float = 1.5,
     mult: float = 1.4142135623730951,
     ash_init: bool = True,
@@ -701,6 +844,10 @@ def _fit_lcash(
     seed: int = 42,
     X_cat: torch.Tensor | None = None,
     n_cat_levels: int | list[int] | None = None,
+    cat_prior: str | list[str | None] | None = None,
+    prior_warmup_epochs: int = 20,
+    prior_refit_every: int = 10,
+    tau2_min: float = 1e-6,
 ) -> cash_PosteriorMeanNorm:
     """Shared implementation for both softmax and proportional odds LC-ASH.
 
@@ -720,6 +867,19 @@ def _fit_lcash(
     X_cat, cat_levels = _validate_inputs(X, X_cat, n_cat_levels)
     X_scaled, X_cat, betahat, sebetahat = _prepare_inputs(X, X_cat, betahat, sebetahat, device)
     scale, log_pi_init = _select_grid(betahat, sebetahat, mult, ash_init, ash_threshold, device)
+
+    # Normalise cat_prior to a list[str|None] (or None) of length F_d.
+    n_cat_cols = X_cat.shape[1] if X_cat is not None else 0
+    cat_prior_list = _normalise_cat_prior(cat_prior, n_cat_cols)
+
+    # Resolve the weight_decay sentinel (Section 7.3). When the user
+    # leaves weight_decay at its default sentinel ``None``, we pick:
+    #   - 0.0 if any Level-2 prior is active (prior takes over the role
+    #     of L2 regularisation),
+    #   - 1e-3 otherwise (preserve the historical default).
+    # An explicit numeric value is honoured as-is.
+    if weight_decay is None:
+        weight_decay = 0.0 if cat_prior_list is not None else 1e-3
 
     # Local RNG for reproducible weight init and batch ordering.
     # Does not mutate global torch RNG state.
@@ -741,7 +901,7 @@ def _fit_lcash(
 
     optimizer = _build_optimizer(model, model_class, weight_decay=weight_decay, lr=lr)
 
-    _train_model(
+    _, priors_state = _train_model(
         model,
         optimizer,
         X_scaled,
@@ -755,6 +915,10 @@ def _fit_lcash(
         verbose,
         label,
         seed=seed,
+        cat_prior=cat_prior_list,
+        prior_warmup_epochs=prior_warmup_epochs,
+        prior_refit_every=prior_refit_every,
+        tau2_min=tau2_min,
     )
 
     post_mean, post_mean2, post_sd, all_pi_values, marginal_loglik = _compute_posteriors(
@@ -766,6 +930,17 @@ def _fit_lcash(
         scale,
         device,
     )
+
+    # Build the priors_fitted result dict: {column_index: {"tau2": ..., "solver": "normal"}}.
+    # Step 4 will move to string keys via the typed feature API.
+    if cat_prior_list is not None:
+        priors_fitted: dict | None = {
+            d: {"tau2": priors_state[d]["tau2"], "solver": cat_prior_list[d]}
+            for d in priors_state
+            if cat_prior_list[d] is not None
+        }
+    else:
+        priors_fitted = None
 
     # `loss` is the negative full-data marginal log-likelihood under the
     # fitted prior, *without* the spike Dirichlet penalty. This matches
@@ -779,6 +954,7 @@ def _fit_lcash(
         loss=-marginal_loglik,
         scale=scale,
         model_param=model.state_dict(),
+        priors_fitted=priors_fitted,
     )
 
 
@@ -794,7 +970,7 @@ def lcash_posterior_means(
     n_epochs: int | None = 200,
     batch_size: int = 512,
     lr: float = 1e-3,
-    weight_decay: float = 1e-3,
+    weight_decay: float | None = None,
     penalty: float = 1.5,
     mult: float = 1.4142135623730951,
     ash_init: bool = True,
@@ -806,6 +982,10 @@ def lcash_posterior_means(
     *,
     X_cat: torch.Tensor | None = None,
     n_cat_levels: int | list[int] | None = None,
+    cat_prior: str | list[str | None] | None = None,
+    prior_warmup_epochs: int = 20,
+    prior_refit_every: int = 10,
+    tau2_min: float = 1e-6,
 ) -> cash_PosteriorMeanNorm:
     """LC-ASH: linear covariate-modulated mixture weights.
 
@@ -826,9 +1006,15 @@ def lcash_posterior_means(
         Mini-batch size for Adam.
     lr : float
         Learning rate.
-    weight_decay : float
+    weight_decay : float or None
         L2 penalty on continuous-feature coefficients only (not bias, not
-        embedding tables).
+        embedding tables).  ``None`` (default) is a sentinel that resolves
+        at runtime (Section 7.3 of the design doc):
+
+        - ``None`` and at least one Level-2 prior active (``cat_prior`` set)
+          -> ``0.0`` (the Level-2 prior replaces L2 regularisation).
+        - ``None`` and no Level-2 prior active -> ``1e-3`` (historical default).
+        - A numeric value: used as-is, regardless of Level-2 state.
     penalty : float
         Dirichlet spike penalty (lambda_pen).  1.0 = no penalty.
     mult : float
@@ -861,12 +1047,30 @@ def lcash_posterior_means(
         Per-column number of levels.  Required when ``X_cat`` is given.
         A scalar is promoted to a length-1 list (after also promoting a
         1-D ``X_cat`` to ``(N, 1)``).
+    cat_prior : str, list[str | None] or None, keyword-only
+        Level-2 prior on each categorical embedding (Section 11 of the
+        design doc).  A scalar string applies the same prior to every
+        categorical column; a list must have one entry per column.  Each
+        entry is either a solver name or ``None`` (no Level-2 prior on
+        that column).  Step 3 supports only ``"normal"``; other strings
+        will be added in Step 5.
+    prior_warmup_epochs : int, keyword-only
+        Number of epochs at the start of training during which the
+        Level-2 prior contribution is omitted.  Default 20.
+    prior_refit_every : int, keyword-only
+        Number of M-step epochs between successive E-steps.  Default 10.
+    tau2_min : float, keyword-only
+        Lower bound on the fitted ``tau2`` for the Normal Level-2 prior.
+        Plumbed through to :func:`fit_normal` and :func:`ebnm_normal`.
+        Default ``1e-6`` prevents the degenerate sink at ``tau2 = 0``.
 
     Returns
     -------
     cash_PosteriorMeanNorm
         Container with post_mean, post_mean2, post_sd, pi_np (G, K),
-        scale (K,), loss, model_param (state dict for warm-starting).
+        scale (K,), loss, model_param (state dict for warm-starting),
+        priors_fitted (dict of fitted Level-2 hyperparameters keyed by
+        categorical column index, or ``None`` when ``cat_prior`` is unset).
     """
     return _fit_lcash(
         X,
@@ -888,6 +1092,10 @@ def lcash_posterior_means(
         seed=seed,
         X_cat=X_cat,
         n_cat_levels=n_cat_levels,
+        cat_prior=cat_prior,
+        prior_warmup_epochs=prior_warmup_epochs,
+        prior_refit_every=prior_refit_every,
+        tau2_min=tau2_min,
     )
 
 
@@ -898,7 +1106,7 @@ def po_lcash_posterior_means(
     n_epochs: int | None = 200,
     batch_size: int = 512,
     lr: float = 1e-3,
-    weight_decay: float = 1e-3,
+    weight_decay: float | None = None,
     penalty: float = 1.5,
     mult: float = 1.4142135623730951,
     ash_init: bool = True,
@@ -910,6 +1118,10 @@ def po_lcash_posterior_means(
     *,
     X_cat: torch.Tensor | None = None,
     n_cat_levels: int | list[int] | None = None,
+    cat_prior: str | list[str | None] | None = None,
+    prior_warmup_epochs: int = 20,
+    prior_refit_every: int = 10,
+    tau2_min: float = 1e-6,
 ) -> cash_PosteriorMeanNorm:
     """Proportional odds LC-ASH: ordered logistic covariate-modulated weights.
 
@@ -933,14 +1145,15 @@ def po_lcash_posterior_means(
     betahat, sebetahat, n_epochs, batch_size, lr, weight_decay, penalty,
     mult, ash_init, ash_threshold, model_param, device, verbose, seed :
         See :func:`lcash_posterior_means`.
-    X_cat, n_cat_levels :
+    X_cat, n_cat_levels, cat_prior, prior_warmup_epochs, prior_refit_every, tau2_min :
         See :func:`lcash_posterior_means`.
 
     Returns
     -------
     cash_PosteriorMeanNorm
         Container with post_mean, post_mean2, post_sd, pi_np (G, K),
-        scale (K,), loss, model_param (state dict for warm-starting).
+        scale (K,), loss, model_param (state dict for warm-starting),
+        priors_fitted (dict of fitted Level-2 hyperparameters or ``None``).
     """
     return _fit_lcash(
         X,
@@ -962,4 +1175,8 @@ def po_lcash_posterior_means(
         seed=seed,
         X_cat=X_cat,
         n_cat_levels=n_cat_levels,
+        cat_prior=cat_prior,
+        prior_warmup_epochs=prior_warmup_epochs,
+        prior_refit_every=prior_refit_every,
+        tau2_min=tau2_min,
     )
