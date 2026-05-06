@@ -933,12 +933,18 @@ def _fit_lcash(
 
     # Build the priors_fitted result dict: {column_index: {"tau2": ..., "solver": "normal"}}.
     # Step 4 will move to string keys via the typed feature API.
-    if cat_prior_list is not None:
-        priors_fitted: dict | None = {
+    # Returns None if no E-step ever fired (e.g. warm-up exceeded n_epochs);
+    # this keeps the contract "dict-with-entries | None" rather than
+    # "possibly empty dict | None".
+    priors_fitted: dict | None
+    if cat_prior_list is not None and len(priors_state) > 0:
+        priors_fitted = {
             d: {"tau2": priors_state[d]["tau2"], "solver": cat_prior_list[d]}
             for d in priors_state
             if cat_prior_list[d] is not None
         }
+        if not priors_fitted:
+            priors_fitted = None
     else:
         priors_fitted = None
 
