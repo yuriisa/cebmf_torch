@@ -7,12 +7,18 @@ Two parameterisations:
 Both map gene features to mixture weights.  A linear alternative to the
 MLP-based CASH solver, with ash-based bias/cut-point initialisation and
 grid pruning.
+
+Categorical covariates are supported natively via per-column ``nn.Embedding``
+tables.  Identifiability of the softmax embedding is fixed by a hard
+reference-category gauge (row 0 of every embedding pinned at zero), enforced
+by a backward hook installed via ``_install_reference_gauge``.
 """
 
 import warnings
 
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
 
 from cebmf_torch.cebnm.cash_solver import (
     cash_PosteriorMeanNorm,
@@ -30,77 +36,134 @@ from cebmf_torch.utils.mixture import autoselect_scales_mix_norm
 class LcashNet(nn.Module):
     """Multinomial logistic regression: features -> mixture weights.
 
-    A single nn.Linear(F, K) followed by softmax. Equivalent to
-    multinomial logistic regression with K classes and F features.
+    Continuous features (if any) feed an ``nn.Linear(cont_dim, num_classes,
+    bias=False)``; categorical columns each feed an ``nn.Embedding(T_d,
+    num_classes)``.  A separate learnable bias completes the logits, which
+    are softmaxed to give per-observation mixture weights.
+
+    The reference-category gauge (row 0 of every embedding pinned at zero)
+    is enforced externally by :func:`_install_reference_gauge`.
 
     Parameters
     ----------
-    input_dim : int
-        Number of input features.
+    cont_dim : int
+        Number of continuous input features.  May be 0 (categorical-only).
     num_classes : int
         Number of mixture components (output classes).
+    cat_n_levels : list[int] | None
+        Per-column number of levels for categorical inputs.  ``None`` or an
+        empty list means no categorical head.
     log_pi_init : torch.Tensor or None
         If provided, (K,) tensor of centred log-weights from a global ash
-        fit. Used to initialise the bias so that softmax(bias) approximates
-        the global ash pi when all feature coefficients are zero.
+        fit.  Used to initialise the bias so that ``softmax(bias)``
+        approximates the global ash pi when all feature coefficients are
+        zero.
+    generator : torch.Generator or None
+        Optional generator for reproducible weight initialisation of the
+        continuous head.
     """
 
     def __init__(
         self,
-        input_dim: int,
+        cont_dim: int,
         num_classes: int,
+        cat_n_levels: list[int] | None = None,
         log_pi_init: torch.Tensor | None = None,
         generator: torch.Generator | None = None,
     ):
         super().__init__()
-        self.linear = nn.Linear(input_dim, num_classes)
-        # Small random perturbation breaks symmetry across features.
-        # Starting from exact zeros leads Adam to different local
-        # optima on high-dimensional feature sets (F > 100).
-        nn.init.normal_(self.linear.weight, mean=0.0, std=0.01, generator=generator)
+        if cont_dim > 0:
+            self.cont = nn.Linear(cont_dim, num_classes, bias=False)
+            # Small random perturbation breaks symmetry across features.
+            # Starting from exact zeros leads Adam to different local
+            # optima on high-dimensional feature sets (F > 100).
+            nn.init.normal_(self.cont.weight, mean=0.0, std=0.01, generator=generator)
+        else:
+            self.cont = None
+
+        self.cat = nn.ModuleList([nn.Embedding(t, num_classes) for t in (cat_n_levels or [])])
+        for emb in self.cat:
+            nn.init.zeros_(emb.weight)
+
+        self.bias = nn.Parameter(torch.zeros(num_classes))
         if log_pi_init is not None:
             with torch.no_grad():
-                self.linear.bias.copy_(log_pi_init)
-        else:
-            nn.init.zeros_(self.linear.bias)
+                self.bias.copy_(log_pi_init)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.softmax(self.linear(x), dim=1)
+    def forward(
+        self,
+        x_cont: torch.Tensor | None,
+        x_cat: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Compute mixture weights pi_k for each observation.
+
+        Either ``x_cont`` or ``x_cat`` may be ``None`` (but not both).
+        """
+        if x_cont is None and x_cat is None:
+            raise ValueError("LcashNet.forward requires at least one of x_cont, x_cat.")
+
+        n = x_cont.shape[0] if x_cont is not None else x_cat.shape[0]
+        logits = self.bias.expand(n, -1).clone()
+        if self.cont is not None and x_cont is not None:
+            logits = logits + self.cont(x_cont)
+        if x_cat is not None:
+            for d, emb in enumerate(self.cat):
+                logits = logits + emb(x_cat[:, d])
+        return torch.softmax(logits, dim=1)
 
 
 class PropOddsLcashNet(nn.Module):
     """Proportional odds (ordered logistic) mapping: features -> mixture weights.
 
-    A single shared weight vector maps features to a scalar signal
-    strength s_i = x_i^T w.  K-1 ordered cut-points convert s_i to
-    mixture weights via cumulative logistic probabilities.
+    A shared weight vector maps continuous features to a scalar signal
+    strength, and per-column scalar embeddings ``nn.Embedding(T_d, 1)`` add
+    categorical contributions to the same scalar score.  K-1 ordered
+    cut-points convert the score to mixture weights via cumulative
+    logistic probabilities.
 
     Parameters
     ----------
-    input_dim : int
-        Number of input features.
+    cont_dim : int
+        Number of continuous input features.  May be 0 (categorical-only).
     num_classes : int
         Number of mixture components (K).
+    cat_n_levels : list[int] | None
+        Per-column number of levels for categorical inputs.
     log_pi_init : torch.Tensor or None
         If provided, (K,) tensor of centred log-weights from a global ash
         fit.  Used to initialise ordered cut-points so that the model
         recovers the global ash pi when all feature coefficients are zero.
+    generator : torch.Generator or None
+        Optional generator for reproducible weight initialisation of the
+        continuous head.
     """
 
     def __init__(
         self,
-        input_dim: int,
+        cont_dim: int,
         num_classes: int,
+        cat_n_levels: list[int] | None = None,
         log_pi_init: torch.Tensor | None = None,
         generator: torch.Generator | None = None,
     ):
         super().__init__()
         K = num_classes
 
-        # Shared feature weights: initialised near zero so the model
-        # starts close to the exchangeable prior.
-        self.w = nn.Parameter(torch.empty(input_dim))
-        nn.init.normal_(self.w, mean=0.0, std=0.01, generator=generator)
+        # Shared continuous weights (initialised near zero so the model
+        # starts close to the exchangeable prior).  When ``cont_dim == 0``
+        # we still register an empty parameter so the optimiser parameter
+        # group construction is uniform; it carries no learnable degrees
+        # of freedom and is omitted from the optimiser if empty.
+        if cont_dim > 0:
+            self.w = nn.Parameter(torch.empty(cont_dim))
+            nn.init.normal_(self.w, mean=0.0, std=0.01, generator=generator)
+        else:
+            self.w = None
+
+        # Per-column scalar embeddings.
+        self.cat = nn.ModuleList([nn.Embedding(t, 1) for t in (cat_n_levels or [])])
+        for emb in self.cat:
+            nn.init.zeros_(emb.weight)
 
         # Cut-point parameterisation: delta_1 (free), delta_2..K-1 (gaps)
         if log_pi_init is not None and K > 1:
@@ -142,28 +205,36 @@ class PropOddsLcashNet(nn.Module):
             return torch.cat([self.delta_1, self.delta_1 + torch.cumsum(gaps, dim=0)])
         return self.delta_1  # K = 2: single cut-point
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Compute mixture weights pi_k for each gene.
+    def forward(
+        self,
+        x_cont: torch.Tensor | None,
+        x_cat: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Compute mixture weights pi_k for each observation.
 
-        Parameters
-        ----------
-        x : tensor (G, F)
-            Feature matrix.
-
-        Returns
-        -------
-        tensor (G, K)
-            Per-gene mixture weights.
+        Either ``x_cont`` or ``x_cat`` may be ``None`` (but not both).
         """
-        s = x @ self.w  # (G,)
+        if x_cont is None and x_cat is None:
+            raise ValueError("PropOddsLcashNet.forward requires at least one of x_cont, x_cat.")
+
+        n = x_cont.shape[0] if x_cont is not None else x_cat.shape[0]
+        device = x_cont.device if x_cont is not None else x_cat.device
+
+        s = torch.zeros(n, device=device)
+        if self.w is not None and x_cont is not None:
+            s = s + x_cont @ self.w
+        if x_cat is not None:
+            for d, emb in enumerate(self.cat):
+                s = s + emb(x_cat[:, d]).squeeze(-1)
+
         theta = self._get_cutpoints()  # (K-1,)
 
         # Cumulative probabilities: P(category <= k) = sigma(theta_k - s)
         cum_probs = torch.sigmoid(theta.unsqueeze(0) - s.unsqueeze(1))  # (G, K-1)
 
         # Convert cumulative to category probabilities
-        ones = torch.ones(s.shape[0], 1, device=x.device)
-        zeros = torch.zeros(s.shape[0], 1, device=x.device)
+        ones = torch.ones(n, 1, device=device)
+        zeros = torch.zeros(n, 1, device=device)
         cum_ext = torch.cat([zeros, cum_probs, ones], dim=1)  # (G, K+1)
         pi = cum_ext[:, 1:] - cum_ext[:, :-1]  # (G, K)
 
@@ -175,31 +246,154 @@ class PropOddsLcashNet(nn.Module):
 
 
 # ============================================================
+# Reference-category gauge
+# ============================================================
+
+
+def _install_reference_gauge(net: nn.Module) -> None:
+    """Pin row 0 of every categorical embedding at zero.
+
+    Called once after ``net`` is constructed (and after any warm-start load
+    via ``model_param``).  The hook zeros the gradient on row 0 of each
+    categorical embedding.  Row 0 is also explicitly zeroed here, defensively,
+    in case a warm-start populated row 0 with non-zero values; without this
+    the gauge would pin row 0 at the loaded (non-zero) value.
+
+    Works on both :class:`LcashNet` and :class:`PropOddsLcashNet` because
+    both expose ``.cat`` as the ``nn.ModuleList`` of categorical embeddings.
+
+    Assumption: the training loop calls ``optimizer.zero_grad()`` between
+    backward passes (the standard PyTorch convention).  The hook clones
+    ``grad`` to avoid in-place mutation of the autograd graph.
+    """
+    for emb in net.cat:
+        if emb.num_embeddings < 2:
+            raise ValueError("Categorical column with fewer than 2 levels is degenerate.")
+        with torch.no_grad():
+            emb.weight[0].zero_()  # defensive: handle warm-start case
+
+        def _zero_row_zero(grad, _emb=emb):
+            grad = grad.clone()
+            grad[0].zero_()
+            return grad
+
+        emb.weight.register_hook(_zero_row_zero)
+
+
+# ============================================================
 # Shared helpers
 # ============================================================
 
 
+def _validate_and_normalise_cat(
+    X_cat: torch.Tensor | None,
+    n_cat_levels: int | list[int] | None,
+) -> tuple[torch.Tensor | None, list[int] | None]:
+    """Validate and normalise categorical inputs.
+
+    Promotes a 1-D ``X_cat`` (and scalar ``n_cat_levels``) to the canonical
+    ``(N, F_d)`` / ``[T_1, ..., T_{F_d}]`` shapes, and checks dtype, range
+    and per-column level counts.
+    """
+    if X_cat is None:
+        if n_cat_levels is not None:
+            raise ValueError("n_cat_levels was provided without X_cat; either supply X_cat or omit n_cat_levels.")
+        return None, None
+
+    if not isinstance(X_cat, torch.Tensor):
+        X_cat = torch.as_tensor(X_cat)
+
+    if X_cat.dtype != torch.long:
+        raise TypeError(
+            "X_cat must be a torch.long tensor of category indices "
+            f"(got dtype {X_cat.dtype}); use X for continuous covariates."
+        )
+
+    if n_cat_levels is None:
+        raise ValueError("n_cat_levels is required when X_cat is provided.")
+
+    # Promote 1-D X_cat to (N, 1) and scalar n_cat_levels to length-1 list.
+    if X_cat.ndim == 1:
+        X_cat = X_cat.reshape(-1, 1)
+    if X_cat.ndim != 2:
+        raise ValueError(f"X_cat must be 1-D or 2-D (got ndim={X_cat.ndim}).")
+
+    if isinstance(n_cat_levels, int):
+        n_cat_levels = [n_cat_levels]
+    else:
+        n_cat_levels = list(n_cat_levels)
+
+    if len(n_cat_levels) != X_cat.shape[1]:
+        raise ValueError(f"n_cat_levels has length {len(n_cat_levels)} but X_cat has {X_cat.shape[1]} columns.")
+
+    for d, t in enumerate(n_cat_levels):
+        if t < 2:
+            raise ValueError(
+                f"Categorical column {d} has n_cat_levels={t}; columns with fewer than 2 levels are degenerate."
+            )
+        col = X_cat[:, d]
+        if col.numel() > 0:
+            col_min = int(col.min().item())
+            col_max = int(col.max().item())
+            if col_min < 0:
+                raise ValueError(
+                    f"X_cat column {d} contains negative index {col_min}; indices must lie in [0, n_cat_levels[d])."
+                )
+            if col_max >= t:
+                raise ValueError(
+                    f"X_cat column {d} contains index {col_max} but "
+                    f"n_cat_levels[{d}]={t}; indices must be < n_cat_levels."
+                )
+
+    return X_cat, n_cat_levels
+
+
+def _validate_inputs(
+    X: torch.Tensor | None,
+    X_cat: torch.Tensor | None,
+    n_cat_levels: int | list[int] | None,
+) -> tuple[torch.Tensor | None, list[int] | None]:
+    """Top-level input validation shared by both entry points.
+
+    Returns the normalised ``(X_cat, n_cat_levels)`` pair.  ``X`` is not
+    modified here; standardisation happens in :func:`_prepare_inputs`.
+    """
+    if X is None and X_cat is None:
+        raise ValueError("At least one of X (continuous) or X_cat (categorical) must be provided.")
+    return _validate_and_normalise_cat(X_cat, n_cat_levels)
+
+
 def _prepare_inputs(
-    X: torch.Tensor,
+    X: torch.Tensor | None,
+    X_cat: torch.Tensor | None,
     betahat: torch.Tensor,
     sebetahat: torch.Tensor,
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Convert inputs to float32 tensors on device and standardise X.
+) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor, torch.Tensor]:
+    """Convert inputs to tensors on device; standardise X (NaN-aware).
 
-    Uses NaN-aware standardisation: mean and std are computed on
-    non-NaN values only, then NaN positions are zero-filled.  This
-    ensures that missing features contribute nothing to the logits
-    (falling back to the intercept/global prior) and that the
-    statistics are not biased by the zero-fill.
+    Categorical inputs bypass standardisation entirely; they are only moved
+    to ``device`` and kept as ``torch.long``.
+
+    The continuous standardisation is NaN-aware: mean and std are computed
+    on non-NaN values only, then NaN positions are zero-filled.  This
+    ensures that missing features contribute nothing to the logits and
+    that the statistics are not biased by the zero-fill.
     """
-    X = torch.as_tensor(X, dtype=torch.float32, device=device)
-    if X.ndim == 1:
-        X = X.reshape(-1, 1)
+    if X is not None:
+        X = torch.as_tensor(X, dtype=torch.float32, device=device)
+        if X.ndim == 1:
+            X = X.reshape(-1, 1)
+        X_scaled = _nanstandardise(X)
+    else:
+        X_scaled = None
+
+    if X_cat is not None:
+        X_cat = X_cat.to(device=device, dtype=torch.long)
+
     betahat = torch.as_tensor(betahat, dtype=torch.float32, device=device)
     sebetahat = torch.as_tensor(sebetahat, dtype=torch.float32, device=device)
-    X_scaled = _nanstandardise(X)
-    return X_scaled, betahat, sebetahat
+    return X_scaled, X_cat, betahat, sebetahat
 
 
 def _nanstandardise(X: torch.Tensor) -> torch.Tensor:
@@ -301,7 +495,8 @@ def _select_grid(
 def _train_model(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
-    X_scaled: torch.Tensor,
+    X_scaled: torch.Tensor | None,
+    X_cat: torch.Tensor | None,
     betahat: torch.Tensor,
     sebetahat: torch.Tensor,
     scale: torch.Tensor,
@@ -316,10 +511,17 @@ def _train_model(
 
     Pre-computes the (G, K) log-likelihood matrix once rather than
     recomputing per mini-batch (logL is constant during training).
-    Batch ordering is seeded for reproducibility.
+    Batch ordering is seeded for reproducibility via a ``DataLoader`` over
+    a ``TensorDataset`` that keeps continuous, categorical and outcome
+    tensors aligned.
     """
     model.train()
-    device = X_scaled.device
+    if X_scaled is not None:
+        device = X_scaled.device
+        n = X_scaled.shape[0]
+    else:
+        device = X_cat.device
+        n = X_cat.shape[0]
 
     # Pre-compute log-likelihood matrix (constant during training).
     loc = torch.zeros_like(scale)
@@ -331,22 +533,25 @@ def _train_model(
             scale=scale,
         )
 
-    # Seeded manual batching (5x faster than DataLoader due to
-    # avoiding per-sample __getitem__ and collation overhead).
-    # Generator and permutation are created on the same device as the
-    # data to avoid CPU/GPU device mismatches.
-    g = torch.Generator(device=device)
+    # We index tensors by integer position rather than passing them
+    # through the DataLoader collate to avoid repeated allocation of
+    # large minibatches.  The DataLoader exists only as a seeded
+    # permutation generator.
+    g = torch.Generator()
     g.manual_seed(seed)
-    n = X_scaled.shape[0]
-    n_batches = max(1, (n + batch_size - 1) // batch_size)
+    index_ds = TensorDataset(torch.arange(n))
+    loader = DataLoader(index_ds, batch_size=batch_size, shuffle=True, generator=g)
+
+    n_batches = max(1, len(loader))
 
     final_epoch_loss = 0.0
     for epoch in range(n_epochs):
         epoch_loss = 0.0
-        perm = torch.randperm(n, generator=g, device=device)
-        for start in range(0, n, batch_size):
-            idx = perm[start : start + batch_size]
-            pi_pred = model(X_scaled[idx])
+        for (idx,) in loader:
+            idx = idx.to(device)
+            x_cont_b = X_scaled[idx] if X_scaled is not None else None
+            x_cat_b = X_cat[idx] if X_cat is not None else None
+            pi_pred = model(x_cont_b, x_cat_b)
             loss = pen_loglik_loss(pi_pred, logL_all[idx], penalty=penalty)
             optimizer.zero_grad()
             loss.backward()
@@ -361,7 +566,8 @@ def _train_model(
 
 def _compute_posteriors(
     model: nn.Module,
-    X_scaled: torch.Tensor,
+    X_scaled: torch.Tensor | None,
+    X_cat: torch.Tensor | None,
     betahat: torch.Tensor,
     sebetahat: torch.Tensor,
     scale: torch.Tensor,
@@ -385,7 +591,7 @@ def _compute_posteriors(
     model.eval()
     loc = torch.zeros_like(scale)
     with torch.no_grad():
-        all_pi_values = model(X_scaled)  # (G, K)
+        all_pi_values = model(X_scaled, X_cat)  # (G, K)
 
         data_loglik = get_data_loglik_normal_torch(
             betahat=betahat, sebetahat=sebetahat, location=loc, scale=scale
@@ -436,8 +642,47 @@ def _warm_start(
             )
 
 
+def _build_optimizer(
+    model: nn.Module,
+    model_class: type,
+    weight_decay: float,
+    lr: float,
+) -> torch.optim.Optimizer:
+    """Build Adam with weight_decay applied only to feature weights.
+
+    Embedding tables and bias/cut-points are excluded from weight decay
+    (cf. existing `linear.bias` / cut-point exemption).
+    """
+    if model_class is LcashNet:
+        feature_params = []
+        if model.cont is not None:
+            feature_params.append(model.cont.weight)
+        no_decay_params = [model.bias]
+        for emb in model.cat:
+            no_decay_params.append(emb.weight)
+        param_groups = []
+        if feature_params:
+            param_groups.append({"params": feature_params, "weight_decay": weight_decay})
+        param_groups.append({"params": no_decay_params, "weight_decay": 0.0})
+    else:  # PropOddsLcashNet
+        feature_params = []
+        if model.w is not None:
+            feature_params.append(model.w)
+        cutpoint_params = [model.delta_1]
+        if model.delta_gaps is not None:
+            cutpoint_params.append(model.delta_gaps)
+        no_decay_params = list(cutpoint_params)
+        for emb in model.cat:
+            no_decay_params.append(emb.weight)
+        param_groups = []
+        if feature_params:
+            param_groups.append({"params": feature_params, "weight_decay": weight_decay})
+        param_groups.append({"params": no_decay_params, "weight_decay": 0.0})
+    return torch.optim.Adam(param_groups, lr=lr)
+
+
 def _fit_lcash(
-    X: torch.Tensor,
+    X: torch.Tensor | None,
     betahat: torch.Tensor,
     sebetahat: torch.Tensor,
     model_class: type,
@@ -454,6 +699,8 @@ def _fit_lcash(
     device: torch.device | None = None,
     verbose: bool = True,
     seed: int = 42,
+    X_cat: torch.Tensor | None = None,
+    n_cat_levels: int | list[int] | None = None,
 ) -> cash_PosteriorMeanNorm:
     """Shared implementation for both softmax and proportional odds LC-ASH.
 
@@ -470,7 +717,8 @@ def _fit_lcash(
     if n_epochs is None:
         n_epochs = 200
 
-    X_scaled, betahat, sebetahat = _prepare_inputs(X, betahat, sebetahat, device)
+    X_cat, cat_levels = _validate_inputs(X, X_cat, n_cat_levels)
+    X_scaled, X_cat, betahat, sebetahat = _prepare_inputs(X, X_cat, betahat, sebetahat, device)
     scale, log_pi_init = _select_grid(betahat, sebetahat, mult, ash_init, ash_threshold, device)
 
     # Local RNG for reproducible weight init and batch ordering.
@@ -479,29 +727,25 @@ def _fit_lcash(
     rng.manual_seed(seed)
 
     K = scale.shape[0]
-    model = model_class(X_scaled.shape[1], K, log_pi_init=log_pi_init, generator=rng).to(device)
+    cont_dim = X_scaled.shape[1] if X_scaled is not None else 0
+    model = model_class(
+        cont_dim,
+        K,
+        cat_n_levels=cat_levels,
+        log_pi_init=log_pi_init,
+        generator=rng,
+    ).to(device)
     _warm_start(model, model_param, label)
+    if cat_levels:
+        _install_reference_gauge(model)
 
-    # Build optimizer: weight_decay on feature weights only.
-    if model_class is LcashNet:
-        param_groups = [
-            {"params": [model.linear.weight], "weight_decay": weight_decay},
-            {"params": [model.linear.bias], "weight_decay": 0.0},
-        ]
-    else:  # PropOddsLcashNet
-        cutpoint_params = [model.delta_1]
-        if model.delta_gaps is not None:
-            cutpoint_params.append(model.delta_gaps)
-        param_groups = [
-            {"params": [model.w], "weight_decay": weight_decay},
-            {"params": cutpoint_params, "weight_decay": 0.0},
-        ]
-    optimizer = torch.optim.Adam(param_groups, lr=lr)
+    optimizer = _build_optimizer(model, model_class, weight_decay=weight_decay, lr=lr)
 
     _train_model(
         model,
         optimizer,
         X_scaled,
+        X_cat,
         betahat,
         sebetahat,
         scale,
@@ -516,6 +760,7 @@ def _fit_lcash(
     post_mean, post_mean2, post_sd, all_pi_values, marginal_loglik = _compute_posteriors(
         model,
         X_scaled,
+        X_cat,
         betahat,
         sebetahat,
         scale,
@@ -526,10 +771,6 @@ def _fit_lcash(
     # fitted prior, *without* the spike Dirichlet penalty. This matches
     # the convention used by `cebnm/emdn.py` and is the meaning required
     # by `cebmf.py`'s per-factor `kl_l[k] = (-loss) - nm_ll_L` formula.
-    # The previous training-loss-on-final-epoch return value was an
-    # unfinished refactor (cf. the `# compute proper full negative
-    # marginal log-likelihood (no penalty)` TODO comments that used to
-    # live in `cash_solver.py`).
     return cash_PosteriorMeanNorm(
         post_mean=post_mean,
         post_mean2=post_mean2,
@@ -547,7 +788,7 @@ def _fit_lcash(
 
 
 def lcash_posterior_means(
-    X: torch.Tensor,
+    X: torch.Tensor | None,
     betahat: torch.Tensor,
     sebetahat: torch.Tensor,
     n_epochs: int | None = 200,
@@ -562,50 +803,64 @@ def lcash_posterior_means(
     device: torch.device | None = None,
     verbose: bool = True,
     seed: int = 42,
+    *,
+    X_cat: torch.Tensor | None = None,
+    n_cat_levels: int | list[int] | None = None,
 ) -> cash_PosteriorMeanNorm:
     """LC-ASH: linear covariate-modulated mixture weights.
 
     Parameters
     ----------
-    X : tensor (G, F)
-        Feature matrix. Standardised internally with NaN-aware
+    X : tensor (G, F) or None
+        Continuous feature matrix.  Standardised internally with NaN-aware
         statistics (mean/std computed on non-NaN values, NaN positions
-        zero-filled). Pre-standardisation is not required.
+        zero-filled).  Pre-standardisation is not required.  May be ``None``
+        if ``X_cat`` is provided.
     betahat : tensor (G,)
         Effect estimates.
     sebetahat : tensor (G,)
         Standard errors.
     n_epochs : int or None
-        Training epochs. Inside cEBMF, overridden by internal_epoch.
+        Training epochs.  Inside cEBMF, overridden by ``internal_epoch``.
     batch_size : int
         Mini-batch size for Adam.
     lr : float
         Learning rate.
     weight_decay : float
-        L2 penalty on feature coefficients only (not bias).
+        L2 penalty on continuous-feature coefficients only (not bias, not
+        embedding tables).
     penalty : float
-        Dirichlet spike penalty (lambda_pen). 1.0 = no penalty.
+        Dirichlet spike penalty (lambda_pen).  1.0 = no penalty.
     mult : float
         Multiplicative step between mixture grid SDs.  Smaller values
-        give a finer grid with more components.  Default sqrt(2)
-        matches R ashr and gives ~27 components before pruning.
+        give a finer grid with more components.  Default sqrt(2) matches
+        R ashr and gives ~27 components before pruning.
     ash_init : bool
-        If True (default), run ash internally (L-BFGS optimizer) to
-        prune the grid to active components and initialise the bias
-        from the ash weights, so the model starts at the exchangeable
-        ash solution when all feature coefficients are zero.
-        If False, use the full grid with uniform bias initialisation.
+        If True (default), run ash internally (L-BFGS optimizer) to prune
+        the grid to active components and initialise the bias from the
+        ash weights, so the model starts at the exchangeable ash solution
+        when all feature coefficients are zero.  If False, use the full
+        grid with uniform bias initialisation.
     ash_threshold : float
-        Pruning threshold: components with pi <= threshold are dropped.
+        Pruning threshold: components with ``pi <= threshold`` are dropped.
         Only used when ``ash_init=True``.
     model_param : dict or None
         State dict from a previous call, for warm-starting.
     device : torch.device or None
-        Compute device. Defaults to CUDA if available.
+        Compute device.  Defaults to CUDA if available.
     verbose : bool
         If True (default), print training progress every 50 epochs.
     seed : int
         Random seed for weight initialisation and batch ordering.
+    X_cat : tensor (G,) or (G, F_d), torch.long, keyword-only
+        Categorical covariate indices.  Each column is treated as an
+        independent factor with its own embedding table.  Bypasses
+        :func:`_nanstandardise`.  Indices in column ``d`` must satisfy
+        ``0 <= idx < n_cat_levels[d]``.  Required ``dtype=torch.long``.
+    n_cat_levels : int, list[int] or None, keyword-only
+        Per-column number of levels.  Required when ``X_cat`` is given.
+        A scalar is promoted to a length-1 list (after also promoting a
+        1-D ``X_cat`` to ``(N, 1)``).
 
     Returns
     -------
@@ -631,11 +886,13 @@ def lcash_posterior_means(
         device=device,
         verbose=verbose,
         seed=seed,
+        X_cat=X_cat,
+        n_cat_levels=n_cat_levels,
     )
 
 
 def po_lcash_posterior_means(
-    X: torch.Tensor,
+    X: torch.Tensor | None,
     betahat: torch.Tensor,
     sebetahat: torch.Tensor,
     n_epochs: int | None = 200,
@@ -650,14 +907,19 @@ def po_lcash_posterior_means(
     device: torch.device | None = None,
     verbose: bool = True,
     seed: int = 42,
+    *,
+    X_cat: torch.Tensor | None = None,
+    n_cat_levels: int | list[int] | None = None,
 ) -> cash_PosteriorMeanNorm:
     """Proportional odds LC-ASH: ordered logistic covariate-modulated weights.
 
-    A shared weight vector maps features to a scalar signal strength
-    s_i = x_i^T w.  K-1 ordered cut-points convert s_i to mixture
-    weights via cumulative logistic probabilities.  This has F + K - 1
-    parameters (vs K * F for softmax LC-ASH), making it more parsimonious
-    when K is large relative to F.
+    A shared weight vector maps continuous features to a scalar signal
+    strength ``s_i = x_i^T w``.  Per-column scalar embeddings add
+    categorical contributions to the same score.  K-1 ordered cut-points
+    convert the score to mixture weights via cumulative logistic
+    probabilities.  This has F + sum_d T_d + K - 1 parameters
+    (vs K * (F + sum_d T_d) for softmax LC-ASH), making it more
+    parsimonious when K is large relative to the feature count.
 
     When ``ash_init=True``, the grid is pruned to ash's active components
     and the cut-points are initialised from the ash weights, so the model
@@ -665,11 +927,14 @@ def po_lcash_posterior_means(
 
     Parameters
     ----------
-    X : tensor (G, F)
-        Feature matrix. Standardised internally with NaN-aware statistics.
+    X : tensor (G, F) or None
+        Continuous feature matrix.  Standardised internally with NaN-aware
+        statistics.  May be ``None`` if ``X_cat`` is provided.
     betahat, sebetahat, n_epochs, batch_size, lr, weight_decay, penalty,
     mult, ash_init, ash_threshold, model_param, device, verbose, seed :
-        See ``lcash_posterior_means``.
+        See :func:`lcash_posterior_means`.
+    X_cat, n_cat_levels :
+        See :func:`lcash_posterior_means`.
 
     Returns
     -------
@@ -695,4 +960,6 @@ def po_lcash_posterior_means(
         device=device,
         verbose=verbose,
         seed=seed,
+        X_cat=X_cat,
+        n_cat_levels=n_cat_levels,
     )
