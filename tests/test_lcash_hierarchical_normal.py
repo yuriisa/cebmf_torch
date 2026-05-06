@@ -17,7 +17,7 @@ import math
 
 import torch
 
-from cebmf_torch.cebnm.lcash import lcash_posterior_means
+from cebmf_torch.cebnm.lcash import lcash_posterior_means, po_lcash_posterior_means
 
 
 def _simulate_per_trait(
@@ -128,13 +128,11 @@ def test_normal_prior_no_op_when_warmup_only():
     }
 
     res_baseline = lcash_posterior_means(**common, cat_prior=None)
-    # Same numeric default for weight_decay between the two runs (1e-3 baseline).
     res_warmup = lcash_posterior_means(
         **common,
         cat_prior=["normal"],
         prior_warmup_epochs=999,  # never fires
         prior_refit_every=10,
-        weight_decay=1e-3,  # match baseline so the only diff is the (inactive) prior path
     )
 
     # priors_fitted is only populated after a successful E-step.
@@ -435,3 +433,60 @@ def test_gauge_row0_excluded_from_level2_fit():
     assert not math.isclose(fitted, expected_buggy, rel_tol=1e-3), (
         "Suspicious: tau2 matches the all-rows mean; row 0 may have leaked into the fit"
     )
+
+
+def test_propodds_normal_prior_smoke():
+    """PO-LC-ASH smoke test with a Normal Level-2 prior on the categorical embedding.
+
+    Categorical-only design: ~30 trait levels, ~50 observations per level.
+    Per-trait true shifts ``w_t ~ N(0, 0.5^2)``. Observations
+    ``beta_i = w_t + noise(0.3)``, ``s_i = 0.3``.
+    """
+    torch.manual_seed(0)
+    g = torch.Generator().manual_seed(0)
+    T = 30
+    n_per = 50
+    n = T * n_per
+    obs_sd = 0.3
+    tau_true = 0.5
+    tau2_min = 1e-6
+
+    w_true = tau_true * torch.randn(T, generator=g)
+    X_cat = torch.cat([torch.full((n_per,), t, dtype=torch.long) for t in range(T)]).reshape(-1, 1)
+    se = torch.full((n,), obs_sd)
+    mu = w_true[X_cat[:, 0]]
+    betahat = mu + se * torch.randn(n, generator=g)
+
+    res = po_lcash_posterior_means(
+        None,
+        betahat,
+        se,
+        X_cat=X_cat,
+        n_cat_levels=T,
+        cat_prior="normal",
+        n_epochs=80,
+        prior_warmup_epochs=20,
+        prior_refit_every=10,
+        verbose=False,
+        seed=42,
+        device=torch.device("cpu"),
+    )
+
+    # priors_fitted populated and tau2 above the floor.
+    assert res.priors_fitted is not None, "priors_fitted should be populated after E-step fires"
+    assert 0 in res.priors_fitted
+    psi = res.priors_fitted[0]
+    assert psi["solver"] == "normal"
+    assert psi["tau2"] > tau2_min
+
+    # Posteriors finite for every observation.
+    assert torch.isfinite(res.post_mean).all(), "post_mean has non-finite entries"
+    assert torch.isfinite(res.post_sd).all(), "post_sd has non-finite entries"
+
+    # PO-specific state-dict keys: delta_1, cat.0.weight; delta_gaps when K > 2.
+    K = res.scale.shape[0]
+    state = res.model_param
+    assert "delta_1" in state
+    assert "cat.0.weight" in state
+    if K > 2:
+        assert "delta_gaps" in state

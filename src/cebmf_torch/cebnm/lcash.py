@@ -791,35 +791,37 @@ def _build_optimizer(
     weight_decay: float,
     lr: float,
 ) -> torch.optim.Optimizer:
-    """Build Adam with weight_decay applied only to feature weights.
+    """Build Adam with weight_decay applied to coefficient-like parameters.
 
-    Embedding tables and bias/cut-points are excluded from weight decay
-    (cf. existing `linear.bias` / cut-point exemption).
+    Coefficient-like parameters (continuous-feature weights and categorical
+    embedding tables) get ``weight_decay``; bias / cut-points are excluded.
+    Treating embeddings the same as continuous weights matches the legacy
+    one-hot path, where trait coefficients sat in ``linear.weight`` and
+    received the same L2 penalty.
     """
     if model_class is LcashNet:
-        feature_params = []
+        decay_params = []
         if model.cont is not None:
-            feature_params.append(model.cont.weight)
-        no_decay_params = [model.bias]
+            decay_params.append(model.cont.weight)
         for emb in model.cat:
-            no_decay_params.append(emb.weight)
+            decay_params.append(emb.weight)
+        no_decay_params = [model.bias]
         param_groups = []
-        if feature_params:
-            param_groups.append({"params": feature_params, "weight_decay": weight_decay})
+        if decay_params:
+            param_groups.append({"params": decay_params, "weight_decay": weight_decay})
         param_groups.append({"params": no_decay_params, "weight_decay": 0.0})
     else:  # PropOddsLcashNet
-        feature_params = []
+        decay_params = []
         if model.w is not None:
-            feature_params.append(model.w)
-        cutpoint_params = [model.delta_1]
-        if model.delta_gaps is not None:
-            cutpoint_params.append(model.delta_gaps)
-        no_decay_params = list(cutpoint_params)
+            decay_params.append(model.w)
         for emb in model.cat:
-            no_decay_params.append(emb.weight)
+            decay_params.append(emb.weight)
+        no_decay_params = [model.delta_1]
+        if model.delta_gaps is not None:
+            no_decay_params.append(model.delta_gaps)
         param_groups = []
-        if feature_params:
-            param_groups.append({"params": feature_params, "weight_decay": weight_decay})
+        if decay_params:
+            param_groups.append({"params": decay_params, "weight_decay": weight_decay})
         param_groups.append({"params": no_decay_params, "weight_decay": 0.0})
     return torch.optim.Adam(param_groups, lr=lr)
 
@@ -872,14 +874,8 @@ def _fit_lcash(
     n_cat_cols = X_cat.shape[1] if X_cat is not None else 0
     cat_prior_list = _normalise_cat_prior(cat_prior, n_cat_cols)
 
-    # Resolve the weight_decay sentinel (Section 7.3). When the user
-    # leaves weight_decay at its default sentinel ``None``, we pick:
-    #   - 0.0 if any Level-2 prior is active (prior takes over the role
-    #     of L2 regularisation),
-    #   - 1e-3 otherwise (preserve the historical default).
-    # An explicit numeric value is honoured as-is.
     if weight_decay is None:
-        weight_decay = 0.0 if cat_prior_list is not None else 1e-3
+        weight_decay = 1e-3
 
     # Local RNG for reproducible weight init and batch ordering.
     # Does not mutate global torch RNG state.
@@ -1013,14 +1009,12 @@ def lcash_posterior_means(
     lr : float
         Learning rate.
     weight_decay : float or None
-        L2 penalty on continuous-feature coefficients only (not bias, not
-        embedding tables).  ``None`` (default) is a sentinel that resolves
-        at runtime (Section 7.3 of the design doc):
-
-        - ``None`` and at least one Level-2 prior active (``cat_prior`` set)
-          -> ``0.0`` (the Level-2 prior replaces L2 regularisation).
-        - ``None`` and no Level-2 prior active -> ``1e-3`` (historical default).
-        - A numeric value: used as-is, regardless of Level-2 state.
+        L2 weight decay applied via Adam to coefficient-like parameters
+        (continuous-feature weights and categorical embeddings). Bias and
+        cut-points are excluded. ``None`` (default) resolves to ``1e-3``.
+        Pass ``0.0`` explicitly to disable Adam-side regularisation entirely
+        (e.g., when relying solely on a Level-2 hierarchical prior via
+        ``cat_prior``).
     penalty : float
         Dirichlet spike penalty (lambda_pen).  1.0 = no penalty.
     mult : float
