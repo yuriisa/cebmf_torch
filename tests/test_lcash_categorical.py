@@ -184,10 +184,24 @@ def test_lcashnet_one_hot_equivalence():
     net_b = LcashNet(cont_dim=0, num_classes=K, cat_n_levels=[T], generator=g_b)
     _install_reference_gauge(net_b)
 
-    # Copy emb weight (T, K) into cont weight (K, T).
+    # The embedding is zero-initialised, and the gauge only re-zeros row 0.
+    # Without perturbation the equivalence check below would pass even if the
+    # forward pass ignored the input entirely.  Populate rows 1..T-1 with
+    # non-zero values so the copy carries a non-trivial linear map across.
+    gen = torch.Generator().manual_seed(123)
+    with torch.no_grad():
+        net_b.cat[0].weight[1:].normal_(generator=gen)
+    assert torch.allclose(net_b.cat[0].weight[0], torch.zeros(K)), (
+        "Reference-category gauge violated: row 0 must remain zero"
+    )
+
+    # Copy emb weight (T, K) into cont weight (K, T) and use a non-trivial
+    # bias so the equivalence check exercises both the linear map and bias.
     with torch.no_grad():
         net_a.cont.weight.copy_(net_b.cat[0].weight.T)
-        net_a.bias.copy_(net_b.bias)
+        bias = 0.5 * torch.randn(K, generator=gen)
+        net_a.bias.copy_(bias)
+        net_b.bias.copy_(bias)
 
     # Build matched inputs.
     indices = torch.randint(0, T, (N,), generator=g_a)
@@ -199,6 +213,9 @@ def test_lcashnet_one_hot_equivalence():
     pi_b = net_b(None, x_cat)
 
     assert pi_a.shape == pi_b.shape == (N, K)
+    # Sanity: pi must vary across observations, otherwise the equivalence
+    # below is trivially satisfied by both nets emitting softmax(bias).
+    assert pi_a.std(dim=0).max() > 1e-3, "pi_a does not depend on input; equivalence test would be vacuous"
     assert torch.allclose(pi_a, pi_b, atol=1e-6, rtol=0), (
         f"One-hot vs embedding pi disagree, max abs diff = {(pi_a - pi_b).abs().max().item()}"
     )
