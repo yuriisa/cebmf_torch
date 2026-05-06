@@ -87,6 +87,64 @@ def test_ebnm_normal_with_se_heteroskedastic():
     # case has tau2_mom strictly different from the ML root in general).
     assert ll_ml - ll_mom > 0.0
 
+    # Direct posterior-formula check: post_mean = (tau2 / (tau2 + s^2)) * beta.
+    shrink_expected = res.tau2 / (res.tau2 + s.pow(2))
+    post_mean_expected = shrink_expected * beta
+    assert torch.allclose(res.post_mean, post_mean_expected, atol=1e-6), (
+        "post_mean does not match (tau2 / (tau2 + s^2)) * beta"
+    )
+
+    # post_var = shrink * s^2; post_mean2 = post_mean^2 + post_var.
+    post_var_expected = shrink_expected * s.pow(2)
+    post_mean2_expected = post_mean_expected.pow(2) + post_var_expected
+    assert torch.allclose(res.post_mean2, post_mean2_expected, atol=1e-6), (
+        "post_mean2 does not match post_mean^2 + post_var"
+    )
+    post_sd_expected = post_var_expected.sqrt()
+    assert torch.allclose(res.post_sd, post_sd_expected, atol=1e-6), "post_sd does not match sqrt(shrink * s^2)"
+
+
+def test_ebnm_normal_against_grid_search():
+    """ML estimate from bisection agrees with an independent fine-grid maximiser.
+
+    This is the strongest independent correctness check on the bisection: a
+    brute-force grid search over tau^2 should yield the same root within the
+    grid resolution. Avoids depending on scipy.
+    """
+    torch.manual_seed(11)
+    n = 1000
+    s = 0.1 + 0.9 * torch.rand(n)
+    mu = torch.randn(n) * 2.0  # tau^2 = 4
+    beta = mu + torch.randn(n) * s
+
+    # Bisection result.
+    res = ebnm_normal(beta, s)
+    tau2_bisect = res.tau2
+
+    # Independent reference: dense grid over tau^2 with log-spacing,
+    # plus a refinement around the bisection answer for grid resolution.
+    coarse = torch.logspace(-3, 1.5, 200)  # 1e-3 to ~31, 200 points
+    fine = torch.linspace(max(tau2_bisect * 0.5, 1e-4), tau2_bisect * 1.5 + 0.01, 200)
+    grid = torch.cat([coarse, fine]).sort().values
+
+    def loglik(tau2_val):
+        var = tau2_val + s.pow(2)
+        return float((-0.5 * (beta.pow(2) / var + var.log())).sum().item())
+
+    lls = torch.tensor([loglik(float(t)) for t in grid])
+    tau2_grid = float(grid[lls.argmax()].item())
+
+    # The grid is fine enough near the optimum that bisection should match
+    # within 5% (the tightest the grid resolution allows).
+    rel_err = abs(tau2_bisect - tau2_grid) / max(abs(tau2_grid), 1e-6)
+    assert rel_err < 0.05, f"bisection tau2={tau2_bisect:.6f} disagrees with grid tau2={tau2_grid:.6f}"
+
+    # Also assert the bisection gives a marginal log-lik no worse than the
+    # grid maximum within float noise.
+    ll_bisect = loglik(tau2_bisect)
+    ll_grid = float(lls.max().item())
+    assert ll_bisect >= ll_grid - 1e-3, f"bisection log_lik={ll_bisect:.6f} worse than grid max={ll_grid:.6f}"
+
 
 def test_ebnm_normal_score_at_optimum():
     torch.manual_seed(3)
@@ -101,7 +159,8 @@ def test_ebnm_normal_score_at_optimum():
     # Either at the boundary tau^2 = 0, or the score is approximately zero.
     if res.tau2 == 0.0:
         # Boundary: the unconstrained ML is at zero, i.e. score(0) <= 0.
-        assert _score(beta, s, 0.0) <= 1e-8
+        # Tolerance scaled to sample size for float32 sum noise.
+        assert _score(beta, s, 0.0) <= 1e-9 * n
     else:
         # Interior optimum: score should be near zero. Bisection runs with
         # tolerance 1e-10 on the un-scaled score, but float32 reductions over
