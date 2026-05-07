@@ -94,6 +94,30 @@ from cebmf_torch.ebnm.ash import PriorType, ash
 
 LOG2PI = math.log(2.0 * math.pi)
 
+# ---------------------------------------------------------------------------
+# Module-level defaults (single source of truth).
+# ---------------------------------------------------------------------------
+# Defaults that appear in more than one public function in this module
+# (e.g. shared between :func:`s_lc_ash_posterior_means`, :func:`fit_new_trait`,
+# and :func:`warm_start_from_pooled_ash`) live here, as a single declaration,
+# so they cannot drift across signatures.
+
+#: Multiplicative step between adjacent slab-grid widths in the autoselect
+#: grid. ``sqrt(2)`` matches the convention of R ``ashr``.
+DEFAULT_GRID_MULT: float = math.sqrt(2.0)
+
+#: Log-likelihood floor for the pooled-ash warm start.
+DEFAULT_ASH_THRESHOLD: float = 1e-6
+
+#: Whether the warm start uses ash's L-BFGS solver (``True``) or its EM
+#: solver (``False``). L-BFGS gives sparser pi values; EM matches the
+#: convention used in lcash's ``ash_init=False`` path.
+DEFAULT_ASH_INIT: bool = True
+
+#: Floor on the level-2 hyperparameter ``tau_c^2``. The joint-Adam trainer
+#: applies this as a soft floor via ``exp(log_tau_c).clamp(min=sqrt(tau2_min))``.
+DEFAULT_TAU2_MIN: float = 1e-6
+
 
 # ---------------------------------------------------------------------------
 # Kernels.
@@ -250,8 +274,8 @@ class SLCAshNet(nn.Module):
     * ``log_c`` (T,) — per-trait log-scale.
     * ``logit_p`` () scalar — shared spike weight on the logit scale.
     * ``eta`` (K,) — pre-softmax shared slab weights.
-    * ``mu_c`` (), ``log_tau_c`` () — only when ``learnable_hyperparams=True``;
-      the level-2 hyperparameters of the ``log c_t`` distribution.
+    * ``mu_c`` (), ``log_tau_c`` () — level-2 hyperparameters of the
+      ``log c_t`` distribution; jointly optimised by the public trainer.
 
     Buffer:
 
@@ -265,11 +289,8 @@ class SLCAshNet(nn.Module):
         log_w_init: torch.Tensor,
         logit_p_init: float,
         log_c_init: float = 0.0,
-        log_c_init_spread: float = 0.0,
-        seed: int = 42,
-        dtype: torch.dtype = torch.float64,
-        learnable_hyperparams: bool = True,
         log_tau_c_init: float = 0.0,
+        dtype: torch.dtype = torch.float64,
     ):
         super().__init__()
         if n_traits < 1:
@@ -288,21 +309,12 @@ class SLCAshNet(nn.Module):
 
         self.n_traits = int(n_traits)
         self.K = int(sigma_t.numel())
-        self.learnable_hyperparams = bool(learnable_hyperparams)
 
-        gen = torch.Generator(device="cpu").manual_seed(int(seed))
-        if log_c_init_spread > 0.0:
-            log_c_noise = torch.randn(n_traits, generator=gen, dtype=dtype) * float(log_c_init_spread)
-        else:
-            log_c_noise = torch.zeros(n_traits, dtype=dtype)
-
-        self.log_c = nn.Parameter(torch.full((n_traits,), float(log_c_init), dtype=dtype) + log_c_noise)
+        self.log_c = nn.Parameter(torch.full((n_traits,), float(log_c_init), dtype=dtype))
         self.logit_p = nn.Parameter(torch.tensor(float(logit_p_init), dtype=dtype))
         self.eta = nn.Parameter(log_w_init_t.clone())
-
-        if self.learnable_hyperparams:
-            self.mu_c = nn.Parameter(torch.tensor(0.0, dtype=dtype))
-            self.log_tau_c = nn.Parameter(torch.tensor(float(log_tau_c_init), dtype=dtype))
+        self.mu_c = nn.Parameter(torch.tensor(0.0, dtype=dtype))
+        self.log_tau_c = nn.Parameter(torch.tensor(float(log_tau_c_init), dtype=dtype))
 
         self.register_buffer("sigma", sigma_t)
 
@@ -337,9 +349,9 @@ def warm_start_from_pooled_ash(
     betahat: torch.Tensor,
     sebetahat: torch.Tensor,
     *,
-    mult: float = math.sqrt(2.0),
-    ash_threshold: float = 1e-6,
-    ash_init: bool = True,
+    mult: float = DEFAULT_GRID_MULT,
+    ash_threshold: float = DEFAULT_ASH_THRESHOLD,
+    ash_init: bool = DEFAULT_ASH_INIT,
     initial_p_floor: float = 0.01,
     initial_p_ceiling: float = 0.99,
 ) -> dict:
@@ -406,96 +418,12 @@ def warm_start_from_pooled_ash(
 
 
 # ---------------------------------------------------------------------------
-# Joint-Adam trainer (default).
-# ---------------------------------------------------------------------------
-
-
-def _train_joint(
-    model: SLCAshNet,
-    betahat: torch.Tensor,
-    sebetahat: torch.Tensor,
-    trait_id: torch.Tensor,
-    *,
-    n_epochs: int,
-    lr: float,
-    weight_decay: float,
-    tau2_min: float,
-    track_loglik_history: bool,
-    verbose: bool,
-    snapshot_every: int = 10,
-) -> dict:
-    """Joint-Adam minimisation of the negative log marginal joint:
-
-    .. math::
-
-        \\mathrm{loss} = -\\sum_g \\log m_g - \\sum_t \\log\\mathcal{N}(\\log c_t \\mid \\mu_c, \\tau_c^2)
-
-    The ``-log Normal`` term includes the ``log tau_c`` constant required when
-    ``tau_c`` is itself a learnable parameter; this is what stabilises ``tau_c``
-    against degenerate collapse to zero.
-    """
-    if not model.learnable_hyperparams:
-        raise ValueError("_train_joint requires learnable_hyperparams=True.")
-    optimizer = torch.optim.Adam(
-        [model.log_c, model.logit_p, model.eta, model.mu_c, model.log_tau_c],
-        lr=lr,
-        weight_decay=weight_decay,
-    )
-    tau_floor = math.sqrt(max(tau2_min, 1e-300))
-
-    history: list[dict] = []
-    loglik_history: list[float] = []
-
-    for epoch in range(n_epochs):
-        optimizer.zero_grad()
-        log_m = s_lc_ash_log_marginal(
-            betahat, sebetahat, trait_id, model.log_c, model.logit_p, model.eta, model.sigma
-        )
-        data_loss = -log_m.sum()
-        tau_c = torch.exp(model.log_tau_c).clamp(min=tau_floor)
-        # Use torch.distributions for the level-2 prior.
-        hyper = Normal(loc=model.mu_c, scale=tau_c)
-        pen = -hyper.log_prob(model.log_c).sum()
-        loss = data_loss + pen
-        loss.backward()
-        optimizer.step()
-
-        if track_loglik_history:
-            with torch.no_grad():
-                loglik_history.append(float(log_m.sum().item()))
-        if (epoch + 1) % snapshot_every == 0 or epoch == n_epochs - 1:
-            with torch.no_grad():
-                tau_c_eff = float(torch.exp(model.log_tau_c).clamp(min=tau_floor))
-                history.append(
-                    {
-                        "mu_c": float(model.mu_c),
-                        "tau2_c": tau_c_eff ** 2,
-                        "p": float(torch.sigmoid(model.logit_p)),
-                        "epoch": int(epoch + 1),
-                    }
-                )
-
-    with torch.no_grad():
-        tau_c_eff = float(torch.exp(model.log_tau_c).clamp(min=tau_floor))
-    psi = {
-        "mu_c": float(model.mu_c),
-        "tau2_c": tau_c_eff ** 2,
-        "p": float(torch.sigmoid(model.logit_p)),
-        "solver": "s_lc_ash_joint_adam",
-    }
-
-    model.recentre_eta_()
-    return {
-        "psi": psi,
-        "history": history,
-        "loglik_history": loglik_history,
-        "final_loss": float(loss.item()),
-        "epochs_done": n_epochs,
-    }
-
-
-# ---------------------------------------------------------------------------
 # Public entry: panel fit.
+#
+# The training loop is inlined here, matching the convention of every other
+# cEBNM solver in this package (e.g. :func:`cebmf_torch.cebnm.cash_posterior_means`,
+# :func:`cebmf_torch.cebnm.emdn_posterior_means`). No internal worker mirrors
+# this signature, so kwargs are declared exactly once.
 # ---------------------------------------------------------------------------
 
 
@@ -508,11 +436,10 @@ def s_lc_ash_posterior_means(
     n_epochs: int = 500,
     lr: float = 1e-2,
     weight_decay: float = 0.0,
-    tau2_min: float = 1e-6,
-    log_c_init_spread: float = 0.0,
-    mult: float = math.sqrt(2.0),
-    ash_threshold: float = 1e-6,
-    ash_init: bool = True,
+    tau2_min: float = DEFAULT_TAU2_MIN,
+    mult: float = DEFAULT_GRID_MULT,
+    ash_threshold: float = DEFAULT_ASH_THRESHOLD,
+    ash_init: bool = DEFAULT_ASH_INIT,
     snapshot_every: int = 10,
     track_loglik_history: bool = False,
     device: torch.device | None = None,
@@ -520,6 +447,20 @@ def s_lc_ash_posterior_means(
     seed: int = 42,
 ):
     """Fit S-LC-ASH on a multi-trait panel.
+
+    Minimises the negative log marginal joint
+
+    .. math::
+
+        \\mathrm{loss} = -\\sum_g \\log m_g
+                       - \\sum_t \\log\\mathcal{N}\\!\\bigl(\\log c_t \\mid \\mu_c, \\tau_c^2\\bigr)
+
+    over ``log_c`` (T,), ``logit_p`` (), ``eta`` (K,), ``mu_c`` (), and
+    ``log_tau_c`` () jointly under a single Adam optimiser. The level-2
+    Normal log-density's ``-T*log(tau_c)`` normaliser provides the
+    restoring gradient against ``tau_c -> 0`` collapse that closed-form
+    alternating empirical Bayes lacks; see the module docstring for
+    panel-dependence caveats.
 
     Parameters
     ----------
@@ -538,19 +479,20 @@ def s_lc_ash_posterior_means(
     weight_decay : float, optional
         Adam weight-decay (default 0; the level-2 prior is the regulariser).
     tau2_min : float, optional
-        Floor on ``tau_c^2`` (default 1e-6).
-    log_c_init_spread : float, optional
-        Optional Gaussian spread on the per-trait ``log c`` initial values.
-        Default 0 = identical init across traits.
+        Floor on ``tau_c^2`` (default :data:`DEFAULT_TAU2_MIN`). Applied
+        as a soft floor via ``exp(log_tau_c).clamp(min=sqrt(tau2_min))``.
     mult, ash_threshold, ash_init : optional
-        Forwarded to :func:`warm_start_from_pooled_ash`.
+        Forwarded to :func:`warm_start_from_pooled_ash`. Defaults are the
+        module-level constants :data:`DEFAULT_GRID_MULT`,
+        :data:`DEFAULT_ASH_THRESHOLD`, :data:`DEFAULT_ASH_INIT`.
     snapshot_every : int, optional
         Snapshot the hyperparameters into ``priors_fitted_history`` every
         this many epochs (default 10).
     track_loglik_history : bool, optional
         Record per-epoch panel marginal log-likelihood (default False).
     device, verbose, seed : optional
-        Standard kwargs.
+        Standard kwargs. With ``verbose=True`` a short progress line is
+        printed every 10 epochs.
 
     Returns
     -------
@@ -592,6 +534,7 @@ def s_lc_ash_posterior_means(
             f"[{int(X_cat.min())}, {int(X_cat.max())}]."
         )
 
+    # ---- Warm start (pooled-ASH fit gives slab grid + weights + pooled spike)
     warm = warm_start_from_pooled_ash(
         betahat, sebetahat, mult=mult, ash_threshold=ash_threshold, ash_init=ash_init
     )
@@ -604,37 +547,82 @@ def s_lc_ash_posterior_means(
         log_w_init=log_w,
         logit_p_init=warm["logit_p_init"],
         log_c_init=0.0,
-        log_c_init_spread=log_c_init_spread,
-        seed=seed,
         dtype=torch.float64,
-        learnable_hyperparams=True,
     ).to(device)
 
-    train_out = _train_joint(
-        model, betahat, sebetahat, X_cat,
-        n_epochs=n_epochs, lr=lr, weight_decay=weight_decay,
-        tau2_min=tau2_min,
-        track_loglik_history=track_loglik_history,
-        verbose=verbose,
-        snapshot_every=snapshot_every,
+    # ---- Joint-Adam training loop (inlined)
+    optimizer = torch.optim.Adam(
+        [model.log_c, model.logit_p, model.eta, model.mu_c, model.log_tau_c],
+        lr=lr,
+        weight_decay=weight_decay,
     )
+    tau_floor = math.sqrt(max(tau2_min, 1e-300))
+    history: list[dict] = []
+    loglik_history: list[float] = []
+    final_loss = float("nan")
+    for epoch in range(n_epochs):
+        optimizer.zero_grad()
+        log_m = s_lc_ash_log_marginal(
+            betahat, sebetahat, X_cat, model.log_c, model.logit_p, model.eta, model.sigma
+        )
+        data_loss = -log_m.sum()
+        tau_c = torch.exp(model.log_tau_c).clamp(min=tau_floor)
+        # Level-2 prior: log c_t ~ N(mu_c, tau_c^2). The log_prob includes
+        # the -T*log(tau_c) normaliser that provides the restoring force
+        # against tau_c -> 0 collapse.
+        pen = -Normal(loc=model.mu_c, scale=tau_c).log_prob(model.log_c).sum()
+        loss = data_loss + pen
+        loss.backward()
+        optimizer.step()
+        final_loss = float(loss.item())
 
+        if track_loglik_history:
+            with torch.no_grad():
+                loglik_history.append(float(log_m.sum().item()))
+        if (epoch + 1) % snapshot_every == 0 or epoch == n_epochs - 1:
+            with torch.no_grad():
+                tau_c_eff = float(torch.exp(model.log_tau_c).clamp(min=tau_floor))
+                history.append(
+                    {
+                        "mu_c": float(model.mu_c),
+                        "tau2_c": tau_c_eff ** 2,
+                        "p": float(torch.sigmoid(model.logit_p)),
+                        "epoch": int(epoch + 1),
+                    }
+                )
+        if verbose and (epoch + 1) % 10 == 0:
+            print(f"[S-LC-ASH] Epoch {epoch + 1}/{n_epochs} | Loss: {final_loss:.4f}")
+
+    # ---- Resolve softmax translation gauge before saving state_dict
+    model.recentre_eta_()
+
+    # ---- Final hyperparameters
+    with torch.no_grad():
+        tau_c_eff = float(torch.exp(model.log_tau_c).clamp(min=tau_floor))
+    psi = {
+        "mu_c": float(model.mu_c),
+        "tau2_c": tau_c_eff ** 2,
+        "p": float(torch.sigmoid(model.logit_p)),
+        "solver": "s_lc_ash_joint_adam",
+    }
+
+    # ---- Posteriors on the panel data using the fitted prior
     with torch.no_grad():
         out = s_lc_ash_compute_posteriors(
             betahat, sebetahat, X_cat, model.log_c, model.logit_p, model.eta, model.sigma
         )
-
     marginal_loglik = float(out["log_marginal"].sum().item())
 
-    psi = train_out["psi"]
     priors_fitted = {0: dict(psi)}
-    history_wrapped: list[dict] = [{0: dict(snap, solver="s_lc_ash_joint_adam")}
-                                    for snap in train_out["history"]]
+    history_wrapped: list[dict] = [
+        {0: dict(snap, solver="s_lc_ash_joint_adam")} for snap in history
+    ]
     if track_loglik_history and history_wrapped:
-        history_wrapped[-1][0]["loglik_history"] = list(train_out["loglik_history"])
+        history_wrapped[-1][0]["loglik_history"] = list(loglik_history)
     elif track_loglik_history:
-        history_wrapped = [{0: {"loglik_history": list(train_out["loglik_history"]),
-                                  "solver": "s_lc_ash_joint_adam"}}]
+        history_wrapped = [
+            {0: {"loglik_history": list(loglik_history), "solver": "s_lc_ash_joint_adam"}}
+        ]
 
     arch_meta = {"family": "s_lc_ash", "T": int(n_cat_levels), "K": int(sigma.numel())}
     trait_params = {
@@ -648,7 +636,7 @@ def s_lc_ash_posterior_means(
         post_sd=out["post_sd"].detach().cpu(),
         pi_np=out["pi_np"].detach().cpu(),
         scale=model.sigma.detach().cpu(),
-        loss=train_out["final_loss"],
+        loss=final_loss,
         model_param=model.state_dict(),
         priors_fitted=priors_fitted,
         priors_fitted_history=history_wrapped,
@@ -670,7 +658,7 @@ def fit_new_trait(
     *,
     n_epochs: int = 200,
     lr: float = 1.0,
-    tau2_min: float = 1e-6,
+    tau2_min: float = DEFAULT_TAU2_MIN,
     tau_inflate: float = 1.0,
     track_loglik_history: bool = False,
     device: torch.device | None = None,
