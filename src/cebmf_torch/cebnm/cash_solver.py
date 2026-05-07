@@ -84,7 +84,22 @@ def pen_loglik_loss(pred_pi, marginal_log_lik, penalty=1.5, epsilon=1e-10):
 
 
 class cash_PosteriorMeanNorm:
-    def __init__(self, post_mean, post_mean2, post_sd, pi_np, scale, loss=0, model_param=None):
+    def __init__(
+        self,
+        post_mean,
+        post_mean2,
+        post_sd,
+        pi_np,
+        scale,
+        loss=0,
+        model_param=None,
+        priors_fitted=None,
+        priors_fitted_history=None,
+        marginal_loglik: float | None = None,
+        x_means: torch.Tensor | None = None,
+        x_stds: torch.Tensor | None = None,
+        _arch_meta: dict | None = None,
+    ):
         """
         Container for the results of the CASH posterior mean estimation.
 
@@ -104,6 +119,46 @@ class cash_PosteriorMeanNorm:
             Final training loss or log-likelihood.
         model_param : dict, optional
             Trained model parameters (state_dict).
+        priors_fitted : dict or None, optional
+            Fitted Level-2 hyperparameters keyed by categorical column
+            (Step 3: integer keys, e.g.
+            ``{0: {"tau2": 0.42, "solver": "normal"}}``). ``None`` when no
+            Level-2 prior was active. Step 4 will move to string keys via
+            the typed feature API.
+        priors_fitted_history : list of dict or None, optional
+            Per-E-step history of fitted Level-2 hyperparameters, one dict per
+            E-step. Each dict has the same shape as ``priors_fitted``
+            (column-index keys, ``{"tau2": ..., "solver": ...}`` values).
+            ``None`` when no Level-2 prior was active. Useful for diagnosing
+            whether ``tau2`` has stabilised by the end of training; users
+            interpreting ``tau2`` for inferential purposes should verify it
+            has flattened across the last several E-steps.
+        marginal_loglik : float or None, optional
+            The full-data marginal log-likelihood under the fitted prior,
+            without the spike Dirichlet penalty. Numerically identical to
+            ``-loss`` for cebmf_torch's LC-ASH path; exposed as a separate,
+            explicitly-named field for users who track convergence or
+            compare across hyperparameter settings without having to invert
+            the sign on ``loss``.
+        x_means : torch.Tensor or None, optional
+            Per-column means of the continuous covariate matrix used at
+            training time, computed NaN-aware. Cached so that
+            :meth:`predict_pi` can apply the same standardisation to new
+            ``X``. ``None`` when no continuous covariates were given.
+        x_stds : torch.Tensor or None, optional
+            Per-column standard deviations of the continuous covariate
+            matrix used at training time, computed NaN-aware. Cached so
+            that :meth:`predict_pi` can apply the same standardisation to
+            new ``X``. ``None`` when no continuous covariates were given.
+        _arch_meta : dict or None, optional
+            Internal field; do not rely on. When populated by the LC-ASH
+            training entry points it carries the network architecture
+            metadata (``{"is_po": bool, "cont_dim": int, "cat_n_levels":
+            list[int]}``) needed by :meth:`predict_pi` to rebuild the
+            net without re-deriving the architecture from the
+            ``state_dict``. ``None`` is supported for backwards
+            compatibility with older pickled results; in that case
+            :meth:`predict_pi` falls back to ``state_dict`` introspection.
         """
         self.post_mean = post_mean
         self.post_mean2 = post_mean2
@@ -112,6 +167,180 @@ class cash_PosteriorMeanNorm:
         self.loss = loss
         self.scale = scale
         self.model_param = model_param
+        self.priors_fitted = priors_fitted
+        self.priors_fitted_history = priors_fitted_history
+        self.marginal_loglik = marginal_loglik
+        self._x_means = x_means
+        self._x_stds = x_stds
+        self._arch_meta = _arch_meta
+
+    def predict_pi(
+        self,
+        X: torch.Tensor | None = None,
+        X_cat: torch.Tensor | None = None,
+        device: torch.device | None = None,
+    ) -> torch.Tensor:
+        """Compute prior mixture weights pi at new (X, X_cat) inputs.
+
+        Reconstructs the trained network from ``self.model_param`` and runs
+        a forward pass on the given inputs. Returns ``(N_new, K)`` mixture
+        weights.
+
+        Continuous covariates ``X`` are standardised using means and
+        standard deviations cached from training (``self._x_means``,
+        ``self._x_stds``). Pre-standardisation is not required.
+
+        At least one of ``X`` and ``X_cat`` must be provided; whichever
+        was used at training time should be used here.
+
+        Parameters
+        ----------
+        X : torch.Tensor or None
+            Continuous covariates, shape ``(N_new, F)``. Must be provided
+            iff the trained model has a continuous head. NaN-aware
+            standardisation is applied internally using the cached
+            training statistics; pre-standardisation is not required.
+        X_cat : torch.Tensor or None
+            Categorical covariate indices, shape ``(N_new,)`` or
+            ``(N_new, F_d)``, ``dtype=torch.long``. Must be provided iff
+            the trained model has at least one categorical head. Each
+            column ``d`` must have indices in
+            ``[0, n_cat_levels[d])``.
+        device : torch.device or None
+            Compute device. Defaults to CPU when not given.
+
+        Returns
+        -------
+        pi : torch.Tensor
+            Per-observation mixture weights, shape ``(N_new, K)``. Rows
+            sum to one within numerical tolerance.
+
+        Raises
+        ------
+        ValueError
+            If ``self.model_param`` is None (model was never trained), if
+            both ``X`` and ``X_cat`` are None, or if the (X, X_cat)
+            combination does not match the trained architecture.
+            Also raised when ``X`` is given but no standardisation
+            statistics were cached on this object.
+        """
+        # Local imports to avoid circular import at module load time.
+        from cebmf_torch.cebnm.lcash import (
+            LcashNet,
+            PropOddsLcashNet,
+            _apply_nanstandardise,
+            _validate_and_normalise_cat,
+        )
+
+        if self.model_param is None:
+            raise ValueError("predict_pi requires a trained model: self.model_param is None.")
+        if X is None and X_cat is None:
+            raise ValueError("predict_pi requires at least one of X, X_cat.")
+
+        device = device or torch.device("cpu")
+        state = self.model_param
+
+        # Prefer architecture metadata cached at training time; fall back
+        # to ``state_dict`` introspection so older pickled results (which
+        # predate ``_arch_meta``) keep working unchanged.
+        arch_meta = getattr(self, "_arch_meta", None)
+        if arch_meta is not None:
+            is_po = arch_meta["is_po"]
+            cont_dim = arch_meta["cont_dim"]
+            cat_levels: list[int] = list(arch_meta["cat_n_levels"])
+        else:
+            # Fallback: introspect state-dict (back-compat for older
+            # pickled ``cash_PosteriorMeanNorm`` instances).
+            # PropOddsLcashNet exposes ``delta_1``; LcashNet exposes
+            # ``bias`` (and never ``delta_1``).
+            is_po = "delta_1" in state
+
+            # Determine cont_dim from cont.weight (LcashNet) or w (PO).
+            if is_po:
+                cont_dim = state["w"].shape[0] if "w" in state else 0
+            else:
+                cont_dim = state["cont.weight"].shape[1] if "cont.weight" in state else 0
+
+            # Determine cat_n_levels by collecting cat.{d}.weight rows.
+            cat_levels = []
+            d = 0
+            while f"cat.{d}.weight" in state:
+                cat_levels.append(state[f"cat.{d}.weight"].shape[0])
+                d += 1
+
+        # Determine K from self.scale.
+        K = int(self.scale.shape[0])
+
+        has_cont = cont_dim > 0
+        has_cat = len(cat_levels) > 0
+
+        # Validate the (X, X_cat) match against the trained architecture.
+        if has_cont and not has_cat:
+            if X is None:
+                raise ValueError("Trained model has only a continuous head; X is required (X_cat must be None).")
+            if X_cat is not None:
+                raise ValueError("Trained model has only a continuous head; X_cat is not allowed (must be None).")
+        elif has_cat and not has_cont:
+            if X_cat is None:
+                raise ValueError("Trained model has only a categorical head; X_cat is required (X must be None).")
+            if X is not None:
+                raise ValueError("Trained model has only a categorical head; X is not allowed (must be None).")
+        elif has_cont and has_cat:
+            if X is None or X_cat is None:
+                raise ValueError(
+                    "Trained model has both continuous and categorical heads; both X and X_cat must be provided."
+                )
+        else:
+            # No heads at all is not a recoverable state.
+            raise ValueError("Trained model has neither a continuous nor a categorical head; cannot predict.")
+
+        # Reconstruct network. Pass the constructor's expected shapes; we
+        # do not need log_pi_init or generator since load_state_dict will
+        # overwrite the parameters.
+        if is_po:
+            net = PropOddsLcashNet(
+                cont_dim=cont_dim,
+                num_classes=K,
+                cat_n_levels=cat_levels if cat_levels else None,
+            )
+        else:
+            net = LcashNet(
+                cont_dim=cont_dim,
+                num_classes=K,
+                cat_n_levels=cat_levels if cat_levels else None,
+            )
+        net.load_state_dict(state)
+        net = net.to(device)
+        net.eval()
+
+        # Prepare X (NaN-aware standardisation using cached training stats).
+        x_cont: torch.Tensor | None = None
+        if X is not None:
+            if self._x_means is None or self._x_stds is None:
+                raise ValueError(
+                    "predict_pi cannot standardise X: training did not save standardisation stats "
+                    "(self._x_means / self._x_stds is None). Refit with the latest version, "
+                    "or pre-standardise X yourself and use the cached internals."
+                )
+            X_t = torch.as_tensor(X, dtype=torch.float32)
+            if X_t.ndim == 1:
+                X_t = X_t.reshape(-1, 1)
+            if X_t.shape[1] != cont_dim:
+                raise ValueError(f"X has {X_t.shape[1]} columns but trained model expects {cont_dim}.")
+            x_means = self._x_means.to(device=device, dtype=torch.float32)
+            x_stds = self._x_stds.to(device=device, dtype=torch.float32)
+            X_t = X_t.to(device=device)
+            x_cont = _apply_nanstandardise(X_t, x_means, x_stds)
+
+        # Prepare X_cat (validate dtype + range; bring to device).
+        x_cat_t: torch.Tensor | None = None
+        if X_cat is not None:
+            x_cat_t, _ = _validate_and_normalise_cat(X_cat, cat_levels)
+            x_cat_t = x_cat_t.to(device=device)
+
+        with torch.no_grad():
+            pi = net(x_cont, x_cat_t)
+        return pi
 
 
 # Class to store the results

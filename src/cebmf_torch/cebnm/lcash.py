@@ -7,12 +7,19 @@ Two parameterisations:
 Both map gene features to mixture weights.  A linear alternative to the
 MLP-based CASH solver, with ash-based bias/cut-point initialisation and
 grid pruning.
+
+Categorical covariates are supported natively via per-column ``nn.Embedding``
+tables.  Identifiability of the softmax embedding is fixed by a hard
+reference-category gauge (row 0 of every embedding pinned at zero), enforced
+by a backward hook installed via ``_install_reference_gauge``.
 """
 
+import math
 import warnings
 
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
 
 from cebmf_torch.cebnm.cash_solver import (
     cash_PosteriorMeanNorm,
@@ -30,77 +37,134 @@ from cebmf_torch.utils.mixture import autoselect_scales_mix_norm
 class LcashNet(nn.Module):
     """Multinomial logistic regression: features -> mixture weights.
 
-    A single nn.Linear(F, K) followed by softmax. Equivalent to
-    multinomial logistic regression with K classes and F features.
+    Continuous features (if any) feed an ``nn.Linear(cont_dim, num_classes,
+    bias=False)``; categorical columns each feed an ``nn.Embedding(T_d,
+    num_classes)``.  A separate learnable bias completes the logits, which
+    are softmaxed to give per-observation mixture weights.
+
+    The reference-category gauge (row 0 of every embedding pinned at zero)
+    is enforced externally by :func:`_install_reference_gauge`.
 
     Parameters
     ----------
-    input_dim : int
-        Number of input features.
+    cont_dim : int
+        Number of continuous input features.  May be 0 (categorical-only).
     num_classes : int
         Number of mixture components (output classes).
+    cat_n_levels : list[int] | None
+        Per-column number of levels for categorical inputs.  ``None`` or an
+        empty list means no categorical head.
     log_pi_init : torch.Tensor or None
         If provided, (K,) tensor of centred log-weights from a global ash
-        fit. Used to initialise the bias so that softmax(bias) approximates
-        the global ash pi when all feature coefficients are zero.
+        fit.  Used to initialise the bias so that ``softmax(bias)``
+        approximates the global ash pi when all feature coefficients are
+        zero.
+    generator : torch.Generator or None
+        Optional generator for reproducible weight initialisation of the
+        continuous head.
     """
 
     def __init__(
         self,
-        input_dim: int,
+        cont_dim: int,
         num_classes: int,
+        cat_n_levels: list[int] | None = None,
         log_pi_init: torch.Tensor | None = None,
         generator: torch.Generator | None = None,
     ):
         super().__init__()
-        self.linear = nn.Linear(input_dim, num_classes)
-        # Small random perturbation breaks symmetry across features.
-        # Starting from exact zeros leads Adam to different local
-        # optima on high-dimensional feature sets (F > 100).
-        nn.init.normal_(self.linear.weight, mean=0.0, std=0.01, generator=generator)
+        if cont_dim > 0:
+            self.cont = nn.Linear(cont_dim, num_classes, bias=False)
+            # Small random perturbation breaks symmetry across features.
+            # Starting from exact zeros leads Adam to different local
+            # optima on high-dimensional feature sets (F > 100).
+            nn.init.normal_(self.cont.weight, mean=0.0, std=0.01, generator=generator)
+        else:
+            self.cont = None
+
+        self.cat = nn.ModuleList([nn.Embedding(t, num_classes) for t in (cat_n_levels or [])])
+        for emb in self.cat:
+            nn.init.zeros_(emb.weight)
+
+        self.bias = nn.Parameter(torch.zeros(num_classes))
         if log_pi_init is not None:
             with torch.no_grad():
-                self.linear.bias.copy_(log_pi_init)
-        else:
-            nn.init.zeros_(self.linear.bias)
+                self.bias.copy_(log_pi_init)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.softmax(self.linear(x), dim=1)
+    def forward(
+        self,
+        x_cont: torch.Tensor | None,
+        x_cat: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Compute mixture weights pi_k for each observation.
+
+        Either ``x_cont`` or ``x_cat`` may be ``None`` (but not both).
+        """
+        if x_cont is None and x_cat is None:
+            raise ValueError("LcashNet.forward requires at least one of x_cont, x_cat.")
+
+        n = x_cont.shape[0] if x_cont is not None else x_cat.shape[0]
+        logits = self.bias.expand(n, -1).clone()
+        if self.cont is not None and x_cont is not None:
+            logits = logits + self.cont(x_cont)
+        if x_cat is not None:
+            for d, emb in enumerate(self.cat):
+                logits = logits + emb(x_cat[:, d])
+        return torch.softmax(logits, dim=1)
 
 
 class PropOddsLcashNet(nn.Module):
     """Proportional odds (ordered logistic) mapping: features -> mixture weights.
 
-    A single shared weight vector maps features to a scalar signal
-    strength s_i = x_i^T w.  K-1 ordered cut-points convert s_i to
-    mixture weights via cumulative logistic probabilities.
+    A shared weight vector maps continuous features to a scalar signal
+    strength, and per-column scalar embeddings ``nn.Embedding(T_d, 1)`` add
+    categorical contributions to the same scalar score.  K-1 ordered
+    cut-points convert the score to mixture weights via cumulative
+    logistic probabilities.
 
     Parameters
     ----------
-    input_dim : int
-        Number of input features.
+    cont_dim : int
+        Number of continuous input features.  May be 0 (categorical-only).
     num_classes : int
         Number of mixture components (K).
+    cat_n_levels : list[int] | None
+        Per-column number of levels for categorical inputs.
     log_pi_init : torch.Tensor or None
         If provided, (K,) tensor of centred log-weights from a global ash
         fit.  Used to initialise ordered cut-points so that the model
         recovers the global ash pi when all feature coefficients are zero.
+    generator : torch.Generator or None
+        Optional generator for reproducible weight initialisation of the
+        continuous head.
     """
 
     def __init__(
         self,
-        input_dim: int,
+        cont_dim: int,
         num_classes: int,
+        cat_n_levels: list[int] | None = None,
         log_pi_init: torch.Tensor | None = None,
         generator: torch.Generator | None = None,
     ):
         super().__init__()
         K = num_classes
 
-        # Shared feature weights: initialised near zero so the model
-        # starts close to the exchangeable prior.
-        self.w = nn.Parameter(torch.empty(input_dim))
-        nn.init.normal_(self.w, mean=0.0, std=0.01, generator=generator)
+        # Shared continuous weights (initialised near zero so the model
+        # starts close to the exchangeable prior).  When ``cont_dim == 0``
+        # we still register an empty parameter so the optimiser parameter
+        # group construction is uniform; it carries no learnable degrees
+        # of freedom and is omitted from the optimiser if empty.
+        if cont_dim > 0:
+            self.w = nn.Parameter(torch.empty(cont_dim))
+            nn.init.normal_(self.w, mean=0.0, std=0.01, generator=generator)
+        else:
+            self.w = None
+
+        # Per-column scalar embeddings.
+        self.cat = nn.ModuleList([nn.Embedding(t, 1) for t in (cat_n_levels or [])])
+        for emb in self.cat:
+            nn.init.zeros_(emb.weight)
 
         # Cut-point parameterisation: delta_1 (free), delta_2..K-1 (gaps)
         if log_pi_init is not None and K > 1:
@@ -142,28 +206,36 @@ class PropOddsLcashNet(nn.Module):
             return torch.cat([self.delta_1, self.delta_1 + torch.cumsum(gaps, dim=0)])
         return self.delta_1  # K = 2: single cut-point
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Compute mixture weights pi_k for each gene.
+    def forward(
+        self,
+        x_cont: torch.Tensor | None,
+        x_cat: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Compute mixture weights pi_k for each observation.
 
-        Parameters
-        ----------
-        x : tensor (G, F)
-            Feature matrix.
-
-        Returns
-        -------
-        tensor (G, K)
-            Per-gene mixture weights.
+        Either ``x_cont`` or ``x_cat`` may be ``None`` (but not both).
         """
-        s = x @ self.w  # (G,)
+        if x_cont is None and x_cat is None:
+            raise ValueError("PropOddsLcashNet.forward requires at least one of x_cont, x_cat.")
+
+        n = x_cont.shape[0] if x_cont is not None else x_cat.shape[0]
+        device = x_cont.device if x_cont is not None else x_cat.device
+
+        s = torch.zeros(n, device=device)
+        if self.w is not None and x_cont is not None:
+            s = s + x_cont @ self.w
+        if x_cat is not None:
+            for d, emb in enumerate(self.cat):
+                s = s + emb(x_cat[:, d]).squeeze(-1)
+
         theta = self._get_cutpoints()  # (K-1,)
 
         # Cumulative probabilities: P(category <= k) = sigma(theta_k - s)
         cum_probs = torch.sigmoid(theta.unsqueeze(0) - s.unsqueeze(1))  # (G, K-1)
 
         # Convert cumulative to category probabilities
-        ones = torch.ones(s.shape[0], 1, device=x.device)
-        zeros = torch.zeros(s.shape[0], 1, device=x.device)
+        ones = torch.ones(n, 1, device=device)
+        zeros = torch.zeros(n, 1, device=device)
         cum_ext = torch.cat([zeros, cum_probs, ones], dim=1)  # (G, K+1)
         pi = cum_ext[:, 1:] - cum_ext[:, :-1]  # (G, K)
 
@@ -175,40 +247,251 @@ class PropOddsLcashNet(nn.Module):
 
 
 # ============================================================
+# Reference-category gauge
+# ============================================================
+
+
+def _install_reference_gauge(
+    net: nn.Module,
+    reference_levels: list[int] | None = None,
+) -> None:
+    """Pin a chosen row of every categorical embedding at zero (gauge).
+
+    Called once after ``net`` is constructed (and after any warm-start load
+    via ``model_param``).  The hook zeros the gradient on the reference row
+    of each categorical embedding.  The reference row is also explicitly
+    zeroed here, defensively, in case a warm-start populated it with non-zero
+    values; without this the gauge would pin that row at the loaded
+    (non-zero) value.
+
+    Works on both :class:`LcashNet` and :class:`PropOddsLcashNet` because
+    both expose ``.cat`` as the ``nn.ModuleList`` of categorical embeddings.
+
+    Parameters
+    ----------
+    net : nn.Module
+        Network with ``.cat`` (an ``nn.ModuleList`` of embeddings).
+    reference_levels : list[int] or None
+        Per-column reference index. ``None`` means index 0 for all columns
+        (the original behaviour, for backwards compatibility). The list
+        must have one entry per categorical column.
+
+    Assumption: the training loop calls ``optimizer.zero_grad()`` between
+    backward passes (the standard PyTorch convention).  The hook clones
+    ``grad`` to avoid in-place mutation of the autograd graph.
+    """
+    refs = reference_levels if reference_levels is not None else [0] * len(net.cat)
+    if len(refs) != len(net.cat):
+        raise ValueError(f"reference_levels has length {len(refs)} but net has {len(net.cat)} categorical columns.")
+    for emb, ref in zip(net.cat, refs, strict=True):
+        if emb.num_embeddings < 2:
+            raise ValueError("Categorical column with fewer than 2 levels is degenerate.")
+        if not (0 <= ref < emb.num_embeddings):
+            raise ValueError(f"reference_level {ref} out of range for embedding with {emb.num_embeddings} levels.")
+        with torch.no_grad():
+            emb.weight[ref].zero_()  # defensive: handle warm-start case
+
+        def _zero_ref_row(grad, _ref=ref):
+            grad = grad.clone()
+            grad[_ref].zero_()
+            return grad
+
+        emb.weight.register_hook(_zero_ref_row)
+
+
+# ============================================================
+# Level-2 prior helpers (Step 3)
+# ============================================================
+
+
+def fit_normal(coeffs: torch.Tensor, tau2_min: float = 1e-6) -> dict:
+    """Level-2 fitter for the Normal prior.
+
+    Calls :func:`cebmf_torch.ebnm.ebnm_normal` with ``sebetahat=None``
+    (zero-SE / MAP-II) on the given coefficients and returns the
+    fitted hyperparameter ``{"tau2": tau2}``.
+
+    The clamp ``tau2_min`` is forwarded to ``ebnm_normal`` so that the
+    returned ``tau2`` is the floor-respecting marginal-ML estimate
+    (Section 5.3 of the design doc; default ``1e-6`` prevents the
+    degenerate sink at ``tau2 = 0``).
+    """
+    from cebmf_torch.ebnm import ebnm_normal
+
+    res = ebnm_normal(coeffs, sebetahat=None, tau2_min=tau2_min)
+    return {"tau2": res.tau2}
+
+
+def logp_normal(theta: torch.Tensor, psi: dict) -> torch.Tensor:
+    """Differentiable log-density of g = N(0, tau2), summed over theta entries.
+
+    Returns a scalar Tensor with autograd flowing through ``theta``.
+    ``psi["tau2"]`` is treated as a Python float / detached constant
+    (no grad through the M-step).
+    """
+    tau2 = psi["tau2"]
+    return -0.5 * (theta.pow(2) / tau2 + math.log(2 * math.pi * tau2)).sum()
+
+
+# ============================================================
 # Shared helpers
 # ============================================================
 
 
+def _validate_and_normalise_cat(
+    X_cat: torch.Tensor | None,
+    n_cat_levels: int | list[int] | None,
+) -> tuple[torch.Tensor | None, list[int] | None]:
+    """Validate and normalise categorical inputs.
+
+    Promotes a 1-D ``X_cat`` (and scalar ``n_cat_levels``) to the canonical
+    ``(N, F_d)`` / ``[T_1, ..., T_{F_d}]`` shapes, and checks dtype, range
+    and per-column level counts.
+    """
+    if X_cat is None:
+        if n_cat_levels is not None:
+            raise ValueError("n_cat_levels was provided without X_cat; either supply X_cat or omit n_cat_levels.")
+        return None, None
+
+    if not isinstance(X_cat, torch.Tensor):
+        X_cat = torch.as_tensor(X_cat)
+
+    if X_cat.dtype != torch.long:
+        raise TypeError(
+            "X_cat must be a torch.long tensor of category indices "
+            f"(got dtype {X_cat.dtype}); use X for continuous covariates."
+        )
+
+    if n_cat_levels is None:
+        raise ValueError("n_cat_levels is required when X_cat is provided.")
+
+    # Promote 1-D X_cat to (N, 1) and scalar n_cat_levels to length-1 list.
+    if X_cat.ndim == 1:
+        X_cat = X_cat.reshape(-1, 1)
+    if X_cat.ndim != 2:
+        raise ValueError(f"X_cat must be 1-D or 2-D (got ndim={X_cat.ndim}).")
+
+    if isinstance(n_cat_levels, int):
+        n_cat_levels = [n_cat_levels]
+    else:
+        n_cat_levels = list(n_cat_levels)
+
+    if len(n_cat_levels) != X_cat.shape[1]:
+        raise ValueError(f"n_cat_levels has length {len(n_cat_levels)} but X_cat has {X_cat.shape[1]} columns.")
+
+    for d, t in enumerate(n_cat_levels):
+        if t < 2:
+            raise ValueError(
+                f"Categorical column {d} has n_cat_levels={t}; columns with fewer than 2 levels are degenerate."
+            )
+        col = X_cat[:, d]
+        if col.numel() > 0:
+            col_min = int(col.min().item())
+            col_max = int(col.max().item())
+            if col_min < 0:
+                raise ValueError(
+                    f"X_cat column {d} contains negative index {col_min}; indices must lie in [0, n_cat_levels[d])."
+                )
+            if col_max >= t:
+                raise ValueError(
+                    f"X_cat column {d} contains index {col_max} but "
+                    f"n_cat_levels[{d}]={t}; indices must be < n_cat_levels."
+                )
+
+    return X_cat, n_cat_levels
+
+
+def _validate_inputs(
+    X: torch.Tensor | None,
+    X_cat: torch.Tensor | None,
+    n_cat_levels: int | list[int] | None,
+) -> tuple[torch.Tensor | None, list[int] | None]:
+    """Top-level input validation shared by both entry points.
+
+    Returns the normalised ``(X_cat, n_cat_levels)`` pair.  ``X`` is not
+    modified here; standardisation happens in :func:`_prepare_inputs`.
+    """
+    if X is None and X_cat is None:
+        raise ValueError("At least one of X (continuous) or X_cat (categorical) must be provided.")
+    return _validate_and_normalise_cat(X_cat, n_cat_levels)
+
+
 def _prepare_inputs(
-    X: torch.Tensor,
+    X: torch.Tensor | None,
+    X_cat: torch.Tensor | None,
     betahat: torch.Tensor,
     sebetahat: torch.Tensor,
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Convert inputs to float32 tensors on device and standardise X.
+) -> tuple[
+    torch.Tensor | None,
+    torch.Tensor | None,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor | None,
+    torch.Tensor | None,
+]:
+    """Convert inputs to tensors on device; standardise X (NaN-aware).
 
-    Uses NaN-aware standardisation: mean and std are computed on
-    non-NaN values only, then NaN positions are zero-filled.  This
-    ensures that missing features contribute nothing to the logits
-    (falling back to the intercept/global prior) and that the
-    statistics are not biased by the zero-fill.
+    Categorical inputs bypass standardisation entirely; they are only moved
+    to ``device`` and kept as ``torch.long``.
+
+    The continuous standardisation is NaN-aware: mean and std are computed
+    on non-NaN values only, then NaN positions are zero-filled.  This
+    ensures that missing features contribute nothing to the logits and
+    that the statistics are not biased by the zero-fill.
+
+    Returns
+    -------
+    X_scaled, X_cat, betahat, sebetahat, x_means, x_stds
+        ``x_means`` and ``x_stds`` are the per-column NaN-aware statistics
+        used to standardise ``X``; both are ``None`` when ``X is None``.
+        These are cached on the result so :meth:`predict_pi` can apply
+        the same standardisation to held-out continuous covariates.
     """
-    X = torch.as_tensor(X, dtype=torch.float32, device=device)
-    if X.ndim == 1:
-        X = X.reshape(-1, 1)
+    if X is not None:
+        X = torch.as_tensor(X, dtype=torch.float32, device=device)
+        if X.ndim == 1:
+            X = X.reshape(-1, 1)
+        X_scaled, x_means, x_stds = _nanstandardise(X)
+    else:
+        X_scaled = None
+        x_means = None
+        x_stds = None
+
+    if X_cat is not None:
+        X_cat = X_cat.to(device=device, dtype=torch.long)
+
     betahat = torch.as_tensor(betahat, dtype=torch.float32, device=device)
     sebetahat = torch.as_tensor(sebetahat, dtype=torch.float32, device=device)
-    X_scaled = _nanstandardise(X)
-    return X_scaled, betahat, sebetahat
+    return X_scaled, X_cat, betahat, sebetahat, x_means, x_stds
 
 
-def _nanstandardise(X: torch.Tensor) -> torch.Tensor:
+def _nanstandardise(X: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Standardise columns using non-NaN values, then zero-fill NaN.
 
     Vectorised implementation. For each column, compute mean and
     population std on observed (non-NaN) entries, standardise observed
     values, and set NaN positions to 0. Columns with zero std
     (constant or all-NaN) are set to 0.
+
+    The projection step (centring/scaling/zero-fill) is delegated to
+    :func:`_apply_nanstandardise` so that training and inference share
+    a single source of truth for the arithmetic. The ``counts > 1`` guard
+    used by an earlier implementation is redundant: when ``counts <= 1``
+    the per-column ``var`` is exactly 0 (the single observed deviation is
+    ``X - X = 0``), so ``sd == 0`` and ``_apply_nanstandardise``'s
+    ``sd > 0`` guard zero-fills those columns automatically.
+
+    Returns
+    -------
+    X_out, mu, sd
+        ``X_out`` is the standardised matrix (NaN positions zero-filled).
+        ``mu`` and ``sd`` are the per-column means and population standard
+        deviations on observed values, used to apply the same
+        standardisation at inference time via :func:`_apply_nanstandardise`.
+        For columns with zero std (constant or all-NaN) we still report
+        the raw mean and a zero std; :func:`_apply_nanstandardise` handles
+        the zero-std case by zero-filling.
     """
     mask = ~torch.isnan(X)
     counts = mask.sum(dim=0)  # (F,)
@@ -225,10 +508,38 @@ def _nanstandardise(X: torch.Tensor) -> torch.Tensor:
     var = (diff**2).sum(dim=0) / safe_counts  # (F,)
     sd = var.sqrt()
 
-    # Standardise observed, zero-fill missing
-    safe_sd = torch.where((sd > 0) & (counts > 1), sd, torch.ones_like(sd))
+    # Delegate projection to the shared helper (single source of truth).
+    X_out = _apply_nanstandardise(X, mu, sd)
+    return X_out, mu, sd
+
+
+def _apply_nanstandardise(
+    X: torch.Tensor,
+    mu: torch.Tensor,
+    sd: torch.Tensor,
+) -> torch.Tensor:
+    """Apply NaN-aware standardisation using externally-provided stats.
+
+    Mirrors the zero-fill behaviour of :func:`_nanstandardise`: NaN
+    positions are zero-filled after centring/scaling, and columns with
+    zero std (or non-finite mu/sd) are zero-filled entirely. Used at
+    inference time by :meth:`cash_PosteriorMeanNorm.predict_pi` so that
+    held-out covariates are standardised against the training statistics
+    and not against per-cohort statistics (which would induce silent
+    covariate shift).
+    """
+    if X.shape[1] != mu.shape[0]:
+        raise ValueError(
+            f"X has {X.shape[1]} columns but cached x_means has {mu.shape[0]}; "
+            "the new X must match the training X column count."
+        )
+    mu = mu.to(device=X.device, dtype=X.dtype)
+    sd = sd.to(device=X.device, dtype=X.dtype)
+    mask = ~torch.isnan(X)
+    diff = torch.where(mask, X - mu, torch.zeros_like(X))
+    safe_sd = torch.where(sd > 0, sd, torch.ones_like(sd))
     X_out = torch.where(
-        mask & (sd > 0).unsqueeze(0) & (counts > 1).unsqueeze(0),
+        mask & (sd > 0).unsqueeze(0),
         diff / safe_sd,
         torch.zeros_like(X),
     )
@@ -298,10 +609,43 @@ def _select_grid(
     return scale, None
 
 
+def _normalise_cat_prior(
+    cat_prior: str | list[str | None] | None,
+    n_cat_cols: int,
+) -> list[str | None] | None:
+    """Promote a scalar ``cat_prior`` to a length-``n_cat_cols`` list.
+
+    Returns ``None`` (no Level-2 prior anywhere) or a list of strings/Nones
+    of length ``n_cat_cols``. Validates that any non-None entry is one of
+    the supported solvers; Step 3 only supports ``"normal"``.
+    """
+    if cat_prior is None:
+        return None
+    if n_cat_cols == 0:
+        raise ValueError("cat_prior was given but X_cat is None / has no columns.")
+    if isinstance(cat_prior, str):
+        cat_prior = [cat_prior] * n_cat_cols
+    else:
+        cat_prior = list(cat_prior)
+    if len(cat_prior) != n_cat_cols:
+        raise ValueError(f"cat_prior has length {len(cat_prior)} but X_cat has {n_cat_cols} columns.")
+    for d, p in enumerate(cat_prior):
+        if p is None:
+            continue
+        if p != "normal":
+            raise ValueError(
+                f"cat_prior[{d}]={p!r}: only 'normal' is currently supported; see Step 5 for additional solvers."
+            )
+    if all(p is None for p in cat_prior):
+        return None
+    return cat_prior
+
+
 def _train_model(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
-    X_scaled: torch.Tensor,
+    X_scaled: torch.Tensor | None,
+    X_cat: torch.Tensor | None,
     betahat: torch.Tensor,
     sebetahat: torch.Tensor,
     scale: torch.Tensor,
@@ -311,15 +655,62 @@ def _train_model(
     verbose: bool,
     label: str,
     seed: int = 42,
-) -> float:
-    """Run the training loop. Returns the final-epoch total loss.
+    cat_prior: list[str | None] | None = None,
+    prior_warmup_epochs: int = 5,
+    prior_refit_every: int = 10,
+    tau2_min: float = 1e-6,
+    prior_tol: float | None = 0.01,
+    reference_levels: list[int] | None = None,
+) -> tuple[float, dict, list[dict]]:
+    """Run the training loop.
+
+    Returns ``(final_epoch_loss, priors_state, priors_state_history)``.
+    ``priors_state_history`` is a list of per-E-step snapshots (one
+    ``dict`` per E-step that fired); each snapshot has the same shape as
+    ``priors_state``. The list is empty when ``cat_prior is None`` or
+    no E-step ever fires.
 
     Pre-computes the (G, K) log-likelihood matrix once rather than
     recomputing per mini-batch (logL is constant during training).
-    Batch ordering is seeded for reproducibility.
+    Batch ordering is seeded for reproducibility via a ``DataLoader`` over
+    a ``TensorDataset`` that keeps continuous, categorical and outcome
+    tensors aligned.
+
+    When ``cat_prior`` is non-None, runs an outer alternating M/E loop
+    (Section 6.1, 11.2 of the design doc):
+
+    - **M-step**: gradient descent for ``prior_refit_every`` epochs, with
+      the cached ``priors_state`` contributing a Level-2 regulariser
+      ``(|B|/N) * R_d`` per minibatch (Section 6.7) once warm-up is over.
+    - **E-step**: refit the Level-2 prior by calling :func:`fit_normal`
+      on ``model.cat[d].weight[1:].detach().flatten()`` (row 0 excluded
+      per the gauge, Section 6.5).
+
+    During warm-up (``epochs_done < prior_warmup_epochs``) the prior
+    contribution is zero. ``priors_state`` is empty until the first
+    E-step, which fires after the first warm-up-completing M-step.
+
+    When ``prior_tol`` is not ``None``, after each E-step the maximum
+    (across active categorical columns) of ``|log(tau2_new) -
+    log(tau2_old)|`` is computed. If this max is below ``prior_tol`` for
+    two consecutive E-steps, training exits early (the alternating loop
+    breaks before consuming the remaining ``n_epochs`` budget). The
+    first E-step has no predecessor and therefore cannot trigger
+    early-stopping by itself.
+
+    ``reference_levels`` selects which row of each categorical embedding
+    is the gauge-pinned reference (excluded from the M-step regulariser
+    and the E-step coefficient set). ``None`` defaults to row 0 for all
+    categorical columns (backwards-compatible behaviour).
     """
     model.train()
-    device = X_scaled.device
+    if X_scaled is not None:
+        device = X_scaled.device
+        n = X_scaled.shape[0]
+    else:
+        device = X_cat.device
+        n = X_cat.shape[0]
+    n_total = n  # |B|/N scaling: N is the size of the training set.
 
     # Pre-compute log-likelihood matrix (constant during training).
     loc = torch.zeros_like(scale)
@@ -331,37 +722,163 @@ def _train_model(
             scale=scale,
         )
 
-    # Seeded manual batching (5x faster than DataLoader due to
-    # avoiding per-sample __getitem__ and collation overhead).
-    # Generator and permutation are created on the same device as the
-    # data to avoid CPU/GPU device mismatches.
-    g = torch.Generator(device=device)
+    # We index tensors by integer position rather than passing them
+    # through the DataLoader collate to avoid repeated allocation of
+    # large minibatches.  The DataLoader exists only as a seeded
+    # permutation generator.
+    g = torch.Generator()
     g.manual_seed(seed)
-    n = X_scaled.shape[0]
-    n_batches = max(1, (n + batch_size - 1) // batch_size)
+    index_ds = TensorDataset(torch.arange(n))
+    loader = DataLoader(index_ds, batch_size=batch_size, shuffle=True, generator=g)
+
+    n_batches = max(1, len(loader))
+    priors_state: dict[int, dict] = {}
+    priors_state_history: list[dict] = []
+    # Counter of consecutive E-steps whose max log(tau2)-change fell
+    # below prior_tol. Triggers early-stopping when it reaches 2.
+    consecutive_below_tol = 0
+
+    # Resolve reference levels (default: row 0 for every categorical
+    # column). The list aligns with model.cat order.
+    n_cat = len(getattr(model, "cat", []))
+    if reference_levels is None:
+        refs = [0] * n_cat
+    else:
+        if len(reference_levels) != n_cat:
+            raise ValueError(
+                f"reference_levels has length {len(reference_levels)} but model has {n_cat} categorical columns."
+            )
+        refs = list(reference_levels)
+
+    # Outer alternating loop. When cat_prior is None, n_outer == 1 and
+    # epochs_this_iter == n_epochs, so we recover the original loop.
+    if cat_prior is None:
+        n_outer = 1
+    else:
+        n_outer = math.ceil(n_epochs / prior_refit_every) if n_epochs > 0 else 0
 
     final_epoch_loss = 0.0
-    for epoch in range(n_epochs):
-        epoch_loss = 0.0
-        perm = torch.randperm(n, generator=g, device=device)
-        for start in range(0, n, batch_size):
-            idx = perm[start : start + batch_size]
-            pi_pred = model(X_scaled[idx])
-            loss = pen_loglik_loss(pi_pred, logL_all[idx], penalty=penalty)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            epoch_loss += loss.item()
-        final_epoch_loss = epoch_loss
-        if verbose and (epoch + 1) % 50 == 0:
-            print(f"[{label}] Epoch {epoch + 1}/{n_epochs} | Loss: {epoch_loss / n_batches:.4f}")
+    early_stop = False
+    for outer_iter in range(n_outer):
+        if cat_prior is None:
+            epochs_done = 0
+            epochs_this_iter = n_epochs
+        else:
+            epochs_done = outer_iter * prior_refit_every
+            epochs_this_iter = min(prior_refit_every, n_epochs - epochs_done)
+            if epochs_this_iter <= 0:
+                break
 
-    return final_epoch_loss
+        # ----- M-step: gradient descent on theta with current psi -----
+        for epoch in range(epochs_this_iter):
+            global_epoch = epochs_done + epoch
+            apply_prior = cat_prior is not None and global_epoch >= prior_warmup_epochs and len(priors_state) > 0
+
+            epoch_loss = 0.0
+            for (idx,) in loader:
+                idx = idx.to(device)
+                x_cont_b = X_scaled[idx] if X_scaled is not None else None
+                x_cat_b = X_cat[idx] if X_cat is not None else None
+                pi_pred = model(x_cont_b, x_cat_b)
+                loss = pen_loglik_loss(pi_pred, logL_all[idx], penalty=penalty)
+                if apply_prior:
+                    batch_size_actual = idx.shape[0]
+                    scale_factor = batch_size_actual / n_total
+                    for d, prior_name in enumerate(cat_prior):
+                        if prior_name is None or d not in priors_state:
+                            continue
+                        psi = priors_state[d]
+                        # The reference row is gauge-pinned and excluded
+                        # from the regulariser (Section 6.5). Slice with
+                        # grad-flow over a boolean mask.
+                        ref_d = refs[d]
+                        T_d = model.cat[d].num_embeddings
+                        keep_mask = torch.ones(T_d, dtype=torch.bool, device=model.cat[d].weight.device)
+                        keep_mask[ref_d] = False
+                        coeffs = model.cat[d].weight[keep_mask]
+                        if prior_name == "normal":
+                            R = -logp_normal(coeffs, psi)
+                        else:
+                            # _normalise_cat_prior should have caught this.
+                            raise ValueError(f"Unsupported Level-2 solver: {prior_name!r}")
+                        loss = loss + scale_factor * R
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                epoch_loss += loss.item()
+
+            final_epoch_loss = epoch_loss
+            if verbose and (global_epoch + 1) % 50 == 0:
+                print(f"[{label}] Epoch {global_epoch + 1}/{n_epochs} | Loss: {epoch_loss / n_batches:.4f}")
+
+        # ----- E-step: refit priors if we are past warm-up -----
+        if cat_prior is None:
+            continue
+        epochs_completed = epochs_done + epochs_this_iter
+        if epochs_completed >= prior_warmup_epochs:
+            # Snapshot the prior state BEFORE the E-step overwrites it,
+            # so we can compute the relative change in log(tau2).
+            prev_priors_state = {d: dict(psi) for d, psi in priors_state.items()}
+            for d, prior_name in enumerate(cat_prior):
+                if prior_name is None:
+                    continue
+                # Detach and flatten over all rows except the reference
+                # (which is gauge-pinned at zero). Both LcashNet (K-wide
+                # rows) and PropOddsLcashNet (scalar rows) flatten the
+                # same way.
+                ref_d = refs[d]
+                T_d = model.cat[d].num_embeddings
+                keep_mask = torch.ones(T_d, dtype=torch.bool, device=model.cat[d].weight.device)
+                keep_mask[ref_d] = False
+                coeffs = model.cat[d].weight[keep_mask].detach().flatten()
+                if prior_name == "normal":
+                    psi = fit_normal(coeffs, tau2_min=tau2_min)
+                else:
+                    raise ValueError(f"Unsupported Level-2 solver: {prior_name!r}")
+                priors_state[d] = psi
+
+            # Record a snapshot of the just-fitted state. Snapshot dicts
+            # are decoupled from priors_state so subsequent E-steps don't
+            # mutate the recorded entries.
+            snapshot = {
+                d: {"tau2": priors_state[d]["tau2"], "solver": cat_prior[d]}
+                for d in priors_state
+                if cat_prior[d] is not None
+            }
+            priors_state_history.append(snapshot)
+
+            # Early-stopping check: requires a previous E-step to compare
+            # against. The first E-step (prev empty) cannot trigger.
+            if prior_tol is not None and prev_priors_state:
+                max_log_change = 0.0
+                for d, prior_name in enumerate(cat_prior):
+                    if prior_name is None or d not in prev_priors_state or d not in priors_state:
+                        continue
+                    tau2_old = prev_priors_state[d]["tau2"]
+                    tau2_new = priors_state[d]["tau2"]
+                    if tau2_old > 0 and tau2_new > 0:
+                        change = abs(math.log(tau2_new) - math.log(tau2_old))
+                        if change > max_log_change:
+                            max_log_change = change
+                if max_log_change < prior_tol:
+                    consecutive_below_tol += 1
+                else:
+                    consecutive_below_tol = 0
+                if consecutive_below_tol >= 2:
+                    if verbose:
+                        print(f"[{label}] Level-2 prior stabilised at epoch {epochs_completed}; early stopping.")
+                    early_stop = True
+
+        if early_stop:
+            break
+
+    return final_epoch_loss, priors_state, priors_state_history
 
 
 def _compute_posteriors(
     model: nn.Module,
-    X_scaled: torch.Tensor,
+    X_scaled: torch.Tensor | None,
+    X_cat: torch.Tensor | None,
     betahat: torch.Tensor,
     sebetahat: torch.Tensor,
     scale: torch.Tensor,
@@ -385,7 +902,7 @@ def _compute_posteriors(
     model.eval()
     loc = torch.zeros_like(scale)
     with torch.no_grad():
-        all_pi_values = model(X_scaled)  # (G, K)
+        all_pi_values = model(X_scaled, X_cat)  # (G, K)
 
         data_loglik = get_data_loglik_normal_torch(
             betahat=betahat, sebetahat=sebetahat, location=loc, scale=scale
@@ -436,8 +953,99 @@ def _warm_start(
             )
 
 
+def _build_optimizer(
+    model: nn.Module,
+    model_class: type,
+    weight_decay: float,
+    lr: float,
+) -> torch.optim.Optimizer:
+    """Build Adam with weight_decay applied to coefficient-like parameters.
+
+    Coefficient-like parameters (continuous-feature weights and categorical
+    embedding tables) get ``weight_decay``; bias / cut-points are excluded.
+    Treating embeddings the same as continuous weights matches the legacy
+    one-hot path, where trait coefficients sat in ``linear.weight`` and
+    received the same L2 penalty.
+    """
+    if model_class is LcashNet:
+        decay_params = []
+        if model.cont is not None:
+            decay_params.append(model.cont.weight)
+        for emb in model.cat:
+            decay_params.append(emb.weight)
+        no_decay_params = [model.bias]
+        param_groups = []
+        if decay_params:
+            param_groups.append({"params": decay_params, "weight_decay": weight_decay})
+        param_groups.append({"params": no_decay_params, "weight_decay": 0.0})
+    else:  # PropOddsLcashNet
+        decay_params = []
+        if model.w is not None:
+            decay_params.append(model.w)
+        for emb in model.cat:
+            decay_params.append(emb.weight)
+        no_decay_params = [model.delta_1]
+        if model.delta_gaps is not None:
+            no_decay_params.append(model.delta_gaps)
+        param_groups = []
+        if decay_params:
+            param_groups.append({"params": decay_params, "weight_decay": weight_decay})
+        param_groups.append({"params": no_decay_params, "weight_decay": 0.0})
+    return torch.optim.Adam(param_groups, lr=lr)
+
+
+def _resolve_weight_decay(weight_decay: float | None, cat_prior_list: list[str | None] | None) -> float:
+    """Single source of truth for the conditional ``weight_decay`` default.
+
+    When the user passes ``weight_decay=None`` (sentinel), we resolve it
+    based on whether a Level-2 prior is active:
+
+    - ``0.0`` if any ``cat_prior`` entry is non-None: the EB prior takes
+      over the regularisation role and Adam L2 has been observed
+      empirically to silently suppress it.
+    - ``1e-3`` otherwise: preserves the historical default for the
+      non-hierarchical fit.
+
+    A non-None ``weight_decay`` is returned verbatim.
+    """
+    if weight_decay is None:
+        return 0.0 if cat_prior_list is not None else 1e-3
+    return weight_decay
+
+
+def _resolve_reference_levels(
+    reference_level: int | list[int] | None,
+    cat_levels: list[int] | None,
+) -> list[int] | None:
+    """Promote ``reference_level`` to a per-column list (or None).
+
+    Returns ``None`` when no categorical columns are present (so the
+    gauge installer takes its default backwards-compatible path) or when
+    ``reference_level`` is ``None`` (caller-side default of row 0 across
+    all columns). An ``int`` is broadcast across all columns; a list
+    must have one entry per categorical column. Per-column bounds are
+    validated against ``cat_levels``.
+    """
+    if cat_levels is None or len(cat_levels) == 0:
+        if reference_level is not None:
+            raise ValueError("reference_level was given but X_cat is None / has no columns.")
+        return None
+    if reference_level is None:
+        return None
+    if isinstance(reference_level, int):
+        refs = [reference_level] * len(cat_levels)
+    else:
+        refs = list(reference_level)
+    if len(refs) != len(cat_levels):
+        raise ValueError(f"reference_level has length {len(refs)} but X_cat has {len(cat_levels)} columns.")
+    for d, (r, T_d) in enumerate(zip(refs, cat_levels, strict=True)):
+        if not (0 <= r < T_d):
+            raise ValueError(f"reference_level[{d}]={r} out of range for {T_d} levels.")
+    return refs
+
+
 def _fit_lcash(
-    X: torch.Tensor,
+    X: torch.Tensor | None,
     betahat: torch.Tensor,
     sebetahat: torch.Tensor,
     model_class: type,
@@ -445,7 +1053,7 @@ def _fit_lcash(
     n_epochs: int = 200,
     batch_size: int = 512,
     lr: float = 1e-3,
-    weight_decay: float = 1e-3,
+    weight_decay: float | None = None,
     penalty: float = 1.5,
     mult: float = 1.4142135623730951,
     ash_init: bool = True,
@@ -454,6 +1062,14 @@ def _fit_lcash(
     device: torch.device | None = None,
     verbose: bool = True,
     seed: int = 42,
+    X_cat: torch.Tensor | None = None,
+    n_cat_levels: int | list[int] | None = None,
+    cat_prior: str | list[str | None] | None = None,
+    prior_warmup_epochs: int = 5,
+    prior_refit_every: int = 10,
+    tau2_min: float = 1e-6,
+    prior_tol: float | None = 0.01,
+    reference_level: int | list[int] | None = None,
 ) -> cash_PosteriorMeanNorm:
     """Shared implementation for both softmax and proportional odds LC-ASH.
 
@@ -470,8 +1086,16 @@ def _fit_lcash(
     if n_epochs is None:
         n_epochs = 200
 
-    X_scaled, betahat, sebetahat = _prepare_inputs(X, betahat, sebetahat, device)
+    X_cat, cat_levels = _validate_inputs(X, X_cat, n_cat_levels)
+    X_scaled, X_cat, betahat, sebetahat, x_means, x_stds = _prepare_inputs(X, X_cat, betahat, sebetahat, device)
     scale, log_pi_init = _select_grid(betahat, sebetahat, mult, ash_init, ash_threshold, device)
+
+    # Normalise cat_prior to a list[str|None] (or None) of length F_d.
+    n_cat_cols = X_cat.shape[1] if X_cat is not None else 0
+    cat_prior_list = _normalise_cat_prior(cat_prior, n_cat_cols)
+
+    weight_decay = _resolve_weight_decay(weight_decay, cat_prior_list)
+    reference_levels = _resolve_reference_levels(reference_level, cat_levels)
 
     # Local RNG for reproducible weight init and batch ordering.
     # Does not mutate global torch RNG state.
@@ -479,29 +1103,25 @@ def _fit_lcash(
     rng.manual_seed(seed)
 
     K = scale.shape[0]
-    model = model_class(X_scaled.shape[1], K, log_pi_init=log_pi_init, generator=rng).to(device)
+    cont_dim = X_scaled.shape[1] if X_scaled is not None else 0
+    model = model_class(
+        cont_dim,
+        K,
+        cat_n_levels=cat_levels,
+        log_pi_init=log_pi_init,
+        generator=rng,
+    ).to(device)
     _warm_start(model, model_param, label)
+    if cat_levels:
+        _install_reference_gauge(model, reference_levels=reference_levels)
 
-    # Build optimizer: weight_decay on feature weights only.
-    if model_class is LcashNet:
-        param_groups = [
-            {"params": [model.linear.weight], "weight_decay": weight_decay},
-            {"params": [model.linear.bias], "weight_decay": 0.0},
-        ]
-    else:  # PropOddsLcashNet
-        cutpoint_params = [model.delta_1]
-        if model.delta_gaps is not None:
-            cutpoint_params.append(model.delta_gaps)
-        param_groups = [
-            {"params": [model.w], "weight_decay": weight_decay},
-            {"params": cutpoint_params, "weight_decay": 0.0},
-        ]
-    optimizer = torch.optim.Adam(param_groups, lr=lr)
+    optimizer = _build_optimizer(model, model_class, weight_decay=weight_decay, lr=lr)
 
-    _train_model(
+    _, priors_state, priors_state_history = _train_model(
         model,
         optimizer,
         X_scaled,
+        X_cat,
         betahat,
         sebetahat,
         scale,
@@ -511,25 +1131,62 @@ def _fit_lcash(
         verbose,
         label,
         seed=seed,
+        cat_prior=cat_prior_list,
+        prior_warmup_epochs=prior_warmup_epochs,
+        prior_refit_every=prior_refit_every,
+        tau2_min=tau2_min,
+        prior_tol=prior_tol,
+        reference_levels=reference_levels,
     )
 
     post_mean, post_mean2, post_sd, all_pi_values, marginal_loglik = _compute_posteriors(
         model,
         X_scaled,
+        X_cat,
         betahat,
         sebetahat,
         scale,
         device,
     )
 
+    # Build the priors_fitted result dict: {column_index: {"tau2": ..., "solver": "normal"}}.
+    # Step 4 will move to string keys via the typed feature API.
+    # Returns None if no E-step ever fired (e.g. warm-up exceeded n_epochs);
+    # this keeps the contract "dict-with-entries | None" rather than
+    # "possibly empty dict | None".
+    priors_fitted: dict | None
+    priors_fitted_history: list[dict] | None
+    if cat_prior_list is not None and len(priors_state) > 0:
+        priors_fitted = {
+            d: {"tau2": priors_state[d]["tau2"], "solver": cat_prior_list[d]}
+            for d in priors_state
+            if cat_prior_list[d] is not None
+        }
+        if not priors_fitted:
+            priors_fitted = None
+    else:
+        priors_fitted = None
+
+    if cat_prior_list is not None and len(priors_state_history) > 0:
+        priors_fitted_history = priors_state_history
+    else:
+        priors_fitted_history = None
+
     # `loss` is the negative full-data marginal log-likelihood under the
     # fitted prior, *without* the spike Dirichlet penalty. This matches
     # the convention used by `cebnm/emdn.py` and is the meaning required
     # by `cebmf.py`'s per-factor `kl_l[k] = (-loss) - nm_ll_L` formula.
-    # The previous training-loss-on-final-epoch return value was an
-    # unfinished refactor (cf. the `# compute proper full negative
-    # marginal log-likelihood (no penalty)` TODO comments that used to
-    # live in `cash_solver.py`).
+    # ``marginal_loglik`` is exposed as an explicit field so users do not
+    # have to invert the sign on ``loss`` to track convergence.
+    # Architecture metadata cached at training time so ``predict_pi`` can
+    # rebuild the net without re-deriving shapes from the ``state_dict``.
+    # Private (leading underscore); not part of the public API.
+    arch_meta = {
+        "is_po": model_class is PropOddsLcashNet,
+        "cont_dim": cont_dim,
+        "cat_n_levels": list(cat_levels) if cat_levels else [],
+    }
+
     return cash_PosteriorMeanNorm(
         post_mean=post_mean,
         post_mean2=post_mean2,
@@ -538,6 +1195,12 @@ def _fit_lcash(
         loss=-marginal_loglik,
         scale=scale,
         model_param=model.state_dict(),
+        priors_fitted=priors_fitted,
+        priors_fitted_history=priors_fitted_history,
+        marginal_loglik=marginal_loglik,
+        x_means=x_means,
+        x_stds=x_stds,
+        _arch_meta=arch_meta,
     )
 
 
@@ -547,13 +1210,13 @@ def _fit_lcash(
 
 
 def lcash_posterior_means(
-    X: torch.Tensor,
+    X: torch.Tensor | None,
     betahat: torch.Tensor,
     sebetahat: torch.Tensor,
     n_epochs: int | None = 200,
     batch_size: int = 512,
     lr: float = 1e-3,
-    weight_decay: float = 1e-3,
+    weight_decay: float | None = None,
     penalty: float = 1.5,
     mult: float = 1.4142135623730951,
     ash_init: bool = True,
@@ -562,56 +1225,133 @@ def lcash_posterior_means(
     device: torch.device | None = None,
     verbose: bool = True,
     seed: int = 42,
+    *,
+    X_cat: torch.Tensor | None = None,
+    n_cat_levels: int | list[int] | None = None,
+    cat_prior: str | list[str | None] | None = None,
+    prior_warmup_epochs: int = 5,
+    prior_refit_every: int = 10,
+    tau2_min: float = 1e-6,
+    prior_tol: float | None = 0.01,
+    reference_level: int | list[int] | None = None,
 ) -> cash_PosteriorMeanNorm:
     """LC-ASH: linear covariate-modulated mixture weights.
 
     Parameters
     ----------
-    X : tensor (G, F)
-        Feature matrix. Standardised internally with NaN-aware
+    X : tensor (G, F) or None
+        Continuous feature matrix.  Standardised internally with NaN-aware
         statistics (mean/std computed on non-NaN values, NaN positions
-        zero-filled). Pre-standardisation is not required.
+        zero-filled).  Pre-standardisation is not required.  May be ``None``
+        if ``X_cat`` is provided.
     betahat : tensor (G,)
         Effect estimates.
     sebetahat : tensor (G,)
         Standard errors.
     n_epochs : int or None
-        Training epochs. Inside cEBMF, overridden by internal_epoch.
+        Training epochs.  Inside cEBMF, overridden by ``internal_epoch``.
     batch_size : int
         Mini-batch size for Adam.
     lr : float
         Learning rate.
-    weight_decay : float
-        L2 penalty on feature coefficients only (not bias).
+    weight_decay : float or None
+        L2 weight decay applied via Adam to coefficient-like parameters
+        (continuous-feature weights and categorical embeddings); bias and
+        cut-points are excluded. ``None`` (default) resolves at runtime:
+
+        - ``0.0`` if any ``cat_prior`` entry is non-None (the Level-2
+          hierarchical prior takes over the regularisation role; mixing
+          with Adam L2 has been observed empirically to silently
+          suppress the EB prior).
+        - ``1e-3`` otherwise (preserves the historical default for
+          non-hierarchical fits).
+
+        Pass an explicit numeric value to override.
     penalty : float
-        Dirichlet spike penalty (lambda_pen). 1.0 = no penalty.
+        Dirichlet spike penalty (lambda_pen).  1.0 = no penalty.
     mult : float
         Multiplicative step between mixture grid SDs.  Smaller values
-        give a finer grid with more components.  Default sqrt(2)
-        matches R ashr and gives ~27 components before pruning.
+        give a finer grid with more components.  Default sqrt(2) matches
+        R ashr and gives ~27 components before pruning.
     ash_init : bool
-        If True (default), run ash internally (L-BFGS optimizer) to
-        prune the grid to active components and initialise the bias
-        from the ash weights, so the model starts at the exchangeable
-        ash solution when all feature coefficients are zero.
-        If False, use the full grid with uniform bias initialisation.
+        If True (default), run ash internally (L-BFGS optimizer) to prune
+        the grid to active components and initialise the bias from the
+        ash weights, so the model starts at the exchangeable ash solution
+        when all feature coefficients are zero.  If False, use the full
+        grid with uniform bias initialisation.
     ash_threshold : float
-        Pruning threshold: components with pi <= threshold are dropped.
+        Pruning threshold: components with ``pi <= threshold`` are dropped.
         Only used when ``ash_init=True``.
     model_param : dict or None
         State dict from a previous call, for warm-starting.
     device : torch.device or None
-        Compute device. Defaults to CUDA if available.
+        Compute device.  Defaults to CUDA if available.
     verbose : bool
         If True (default), print training progress every 50 epochs.
     seed : int
         Random seed for weight initialisation and batch ordering.
+    X_cat : tensor (G,) or (G, F_d), torch.long, keyword-only
+        Categorical covariate indices.  Each column is treated as an
+        independent factor with its own embedding table.  Bypasses
+        :func:`_nanstandardise`.  Indices in column ``d`` must satisfy
+        ``0 <= idx < n_cat_levels[d]``.  Required ``dtype=torch.long``.
+    n_cat_levels : int, list[int] or None, keyword-only
+        Per-column number of levels.  Required when ``X_cat`` is given.
+        A scalar is promoted to a length-1 list (after also promoting a
+        1-D ``X_cat`` to ``(N, 1)``).
+    cat_prior : str, list[str | None] or None, keyword-only
+        Level-2 prior on each categorical embedding (Section 11 of the
+        design doc).  A scalar string applies the same prior to every
+        categorical column; a list must have one entry per column.  Each
+        entry is either a solver name or ``None`` (no Level-2 prior on
+        that column).  Step 3 supports only ``"normal"``; other strings
+        will be added in Step 5.
+    prior_warmup_epochs : int, keyword-only
+        Number of epochs at the start of training during which the
+        Level-2 prior contribution is omitted.  Default 5 epochs. The
+        warmup window must be short enough that embeddings have not yet
+        diffused under the noise floor / weight_decay; otherwise the
+        first E-step learns a wide prior from noise rather than data
+        signal.
+    prior_refit_every : int, keyword-only
+        Number of M-step epochs between successive E-steps.  Default 10.
+    tau2_min : float, keyword-only
+        Lower bound on the fitted ``tau2`` for the Normal Level-2 prior.
+        Plumbed through to :func:`fit_normal` and :func:`ebnm_normal`.
+        Default ``1e-6`` prevents the degenerate sink at ``tau2 = 0``.
+    prior_tol : float or None, keyword-only
+        Relative-change tolerance on log(tau2) for early-stopping the
+        alternating M/E loop. If the absolute change ``|log tau2_new -
+        log tau2_old|`` falls below ``prior_tol`` for two consecutive
+        E-steps (across all active categorical columns), training exits
+        early without consuming the remaining ``n_epochs`` budget. Set
+        to ``None`` to disable early stopping. Default 0.01.
+    reference_level : int, list of int, or None, keyword-only
+        Index of the categorical level pinned at zero (the reference) for
+        each categorical column. ``None`` (default) means index 0 for all
+        columns. An int applies the same reference to every categorical
+        column. A list must have one int per categorical column.
+
+        NOTE: The choice of reference level is a gauge fixing; it does
+        not affect predictive output but it DOES affect the fitted
+        Level-2 ``tau2`` (because tau2 = mean of squared shifts relative
+        to the reference). For interpretability of ``tau2`` as "spread
+        of trait shifts around the average trait", choosing a near-mean
+        or near-median trait as the reference is more meaningful than
+        an arbitrary first-position trait.
 
     Returns
     -------
     cash_PosteriorMeanNorm
         Container with post_mean, post_mean2, post_sd, pi_np (G, K),
-        scale (K,), loss, model_param (state dict for warm-starting).
+        scale (K,), loss, model_param (state dict for warm-starting),
+        priors_fitted (dict of fitted Level-2 hyperparameters keyed by
+        categorical column index, or ``None`` when ``cat_prior`` is unset),
+        priors_fitted_history (per-E-step list of snapshots, or
+        ``None`` when no E-step ever fires; useful for diagnosing whether
+        ``tau2`` has stabilised by end of training), and
+        marginal_loglik (the full-data marginal log-likelihood under
+        the fitted prior, equivalently ``-loss``).
     """
     return _fit_lcash(
         X,
@@ -631,17 +1371,25 @@ def lcash_posterior_means(
         device=device,
         verbose=verbose,
         seed=seed,
+        X_cat=X_cat,
+        n_cat_levels=n_cat_levels,
+        cat_prior=cat_prior,
+        prior_warmup_epochs=prior_warmup_epochs,
+        prior_refit_every=prior_refit_every,
+        tau2_min=tau2_min,
+        prior_tol=prior_tol,
+        reference_level=reference_level,
     )
 
 
 def po_lcash_posterior_means(
-    X: torch.Tensor,
+    X: torch.Tensor | None,
     betahat: torch.Tensor,
     sebetahat: torch.Tensor,
     n_epochs: int | None = 200,
     batch_size: int = 512,
     lr: float = 1e-3,
-    weight_decay: float = 1e-3,
+    weight_decay: float | None = None,
     penalty: float = 1.5,
     mult: float = 1.4142135623730951,
     ash_init: bool = True,
@@ -650,14 +1398,25 @@ def po_lcash_posterior_means(
     device: torch.device | None = None,
     verbose: bool = True,
     seed: int = 42,
+    *,
+    X_cat: torch.Tensor | None = None,
+    n_cat_levels: int | list[int] | None = None,
+    cat_prior: str | list[str | None] | None = None,
+    prior_warmup_epochs: int = 5,
+    prior_refit_every: int = 10,
+    tau2_min: float = 1e-6,
+    prior_tol: float | None = 0.01,
+    reference_level: int | list[int] | None = None,
 ) -> cash_PosteriorMeanNorm:
     """Proportional odds LC-ASH: ordered logistic covariate-modulated weights.
 
-    A shared weight vector maps features to a scalar signal strength
-    s_i = x_i^T w.  K-1 ordered cut-points convert s_i to mixture
-    weights via cumulative logistic probabilities.  This has F + K - 1
-    parameters (vs K * F for softmax LC-ASH), making it more parsimonious
-    when K is large relative to F.
+    A shared weight vector maps continuous features to a scalar signal
+    strength ``s_i = x_i^T w``.  Per-column scalar embeddings add
+    categorical contributions to the same score.  K-1 ordered cut-points
+    convert the score to mixture weights via cumulative logistic
+    probabilities.  This has F + sum_d T_d + K - 1 parameters
+    (vs K * (F + sum_d T_d) for softmax LC-ASH), making it more
+    parsimonious when K is large relative to the feature count.
 
     When ``ash_init=True``, the grid is pruned to ash's active components
     and the cut-points are initialised from the ash weights, so the model
@@ -665,17 +1424,25 @@ def po_lcash_posterior_means(
 
     Parameters
     ----------
-    X : tensor (G, F)
-        Feature matrix. Standardised internally with NaN-aware statistics.
+    X : tensor (G, F) or None
+        Continuous feature matrix.  Standardised internally with NaN-aware
+        statistics.  May be ``None`` if ``X_cat`` is provided.
     betahat, sebetahat, n_epochs, batch_size, lr, weight_decay, penalty,
     mult, ash_init, ash_threshold, model_param, device, verbose, seed :
-        See ``lcash_posterior_means``.
+        See :func:`lcash_posterior_means`.
+    X_cat, n_cat_levels, cat_prior, prior_warmup_epochs, prior_refit_every,
+    tau2_min, prior_tol, reference_level :
+        See :func:`lcash_posterior_means`.
 
     Returns
     -------
     cash_PosteriorMeanNorm
         Container with post_mean, post_mean2, post_sd, pi_np (G, K),
-        scale (K,), loss, model_param (state dict for warm-starting).
+        scale (K,), loss, model_param (state dict for warm-starting),
+        priors_fitted (dict of fitted Level-2 hyperparameters or ``None``),
+        priors_fitted_history (per-E-step list of snapshots, or ``None``),
+        and marginal_loglik (the full-data marginal log-likelihood under
+        the fitted prior, equivalently ``-loss``).
     """
     return _fit_lcash(
         X,
@@ -695,4 +1462,12 @@ def po_lcash_posterior_means(
         device=device,
         verbose=verbose,
         seed=seed,
+        X_cat=X_cat,
+        n_cat_levels=n_cat_levels,
+        cat_prior=cat_prior,
+        prior_warmup_epochs=prior_warmup_epochs,
+        prior_refit_every=prior_refit_every,
+        tau2_min=tau2_min,
+        prior_tol=prior_tol,
+        reference_level=reference_level,
     )
