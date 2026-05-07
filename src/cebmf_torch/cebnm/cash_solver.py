@@ -99,6 +99,7 @@ class cash_PosteriorMeanNorm:
         x_means: torch.Tensor | None = None,
         x_stds: torch.Tensor | None = None,
         _arch_meta: dict | None = None,
+        trait_params: dict | None = None,
     ):
         """
         Container for the results of the CASH posterior mean estimation.
@@ -156,9 +157,20 @@ class cash_PosteriorMeanNorm:
             metadata (``{"is_po": bool, "cont_dim": int, "cat_n_levels":
             list[int]}``) needed by :meth:`predict_pi` to rebuild the
             net without re-deriving the architecture from the
-            ``state_dict``. ``None`` is supported for backwards
+            ``state_dict``. The S-LC-ASH training entry points populate
+            it with ``{"family": "s_lc_ash", "T": int, "K": int}`` (or
+            ``{"family": "s_lc_ash", "single_trait": True, "K": int}``
+            for cold-start results) and :meth:`predict_pi` raises
+            :class:`NotImplementedError` for that family with a pointer
+            to :func:`fit_new_trait`. ``None`` is supported for backwards
             compatibility with older pickled results; in that case
             :meth:`predict_pi` falls back to ``state_dict`` introspection.
+        trait_params : dict or None, optional
+            Per-trait scalar parameters fitted by the S-LC-ASH family:
+            ``{"c": Tensor (T,), "p": Tensor (1,)}`` where ``c`` is per
+            trait and ``p`` is the shared spike weight. ``None`` for
+            LC-ASH and other families that do not parameterise traits
+            as scalars.
         """
         self.post_mean = post_mean
         self.post_mean2 = post_mean2
@@ -173,6 +185,7 @@ class cash_PosteriorMeanNorm:
         self._x_means = x_means
         self._x_stds = x_stds
         self._arch_meta = _arch_meta
+        self.trait_params = trait_params
 
     def predict_pi(
         self,
@@ -244,6 +257,12 @@ class cash_PosteriorMeanNorm:
         # to ``state_dict`` introspection so older pickled results (which
         # predate ``_arch_meta``) keep working unchanged.
         arch_meta = getattr(self, "_arch_meta", None)
+        if arch_meta is not None and arch_meta.get("family") == "s_lc_ash":
+            raise NotImplementedError(
+                "predict_pi is not implemented for the S-LC-ASH family. "
+                "Use cebmf_torch.cebnm.fit_new_trait(betahat, sebetahat, panel_result) "
+                "to obtain posteriors for a new trait given the panel-trained model."
+            )
         if arch_meta is not None:
             is_po = arch_meta["is_po"]
             cont_dim = arch_meta["cont_dim"]
