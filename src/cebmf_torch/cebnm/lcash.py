@@ -29,6 +29,19 @@ from cebmf_torch.ebnm.ash import PriorType, ash
 from cebmf_torch.utils.distribution_operation import get_data_loglik_normal_torch
 from cebmf_torch.utils.mixture import autoselect_scales_mix_norm
 
+# ---------------------------------------------------------------------------
+# Module-level defaults (single source of truth).
+# ---------------------------------------------------------------------------
+# Public entry points and the internal worker share many kwargs; defaults are
+# defined once here and referenced from each signature so they cannot drift.
+# Add to this list as duplications are detected.
+
+#: Dirichlet pseudo-count on the spike component of the mixture-weight prior.
+#: ``1.0`` is uniform / no penalty (the convention of R ``ashr``).
+#: Values ``> 1`` add ``penalty - 1`` fictitious "fully null" observations
+#: per gene before fitting and bias the spike weight upward.
+DEFAULT_PENALTY: float = 1.0
+
 # ============================================================
 # Model classes
 # ============================================================
@@ -1054,7 +1067,7 @@ def _fit_lcash(
     batch_size: int = 512,
     lr: float = 1e-3,
     weight_decay: float | None = None,
-    penalty: float = 1.5,
+    penalty: float = DEFAULT_PENALTY,
     mult: float = 1.4142135623730951,
     ash_init: bool = True,
     ash_threshold: float = 1e-6,
@@ -1217,7 +1230,7 @@ def lcash_posterior_means(
     batch_size: int = 512,
     lr: float = 1e-3,
     weight_decay: float | None = None,
-    penalty: float = 1.5,
+    penalty: float = DEFAULT_PENALTY,
     mult: float = 1.4142135623730951,
     ash_init: bool = True,
     ash_threshold: float = 1e-6,
@@ -1268,7 +1281,14 @@ def lcash_posterior_means(
 
         Pass an explicit numeric value to override.
     penalty : float
-        Dirichlet spike penalty (lambda_pen).  1.0 = no penalty.
+        Dirichlet spike penalty (lambda_pen). The fitted spike weight is
+        biased upward as ``log p(pi) += (penalty - 1) * sum_g log pi_0(g)``
+        across genes. ``1.0`` (the default) is equivalent to no penalty
+        and matches the convention of R ``ashr``. Values ``> 1`` add
+        ``penalty - 1`` fictitious "fully null" observations per gene
+        before fitting and bias the spike weight upward; this can win
+        held-out predictive density on data where most genes really are
+        null but penalises data with many real effects.
     mult : float
         Multiplicative step between mixture grid SDs.  Smaller values
         give a finer grid with more components.  Default sqrt(2) matches
@@ -1390,7 +1410,7 @@ def po_lcash_posterior_means(
     batch_size: int = 512,
     lr: float = 1e-3,
     weight_decay: float | None = None,
-    penalty: float = 1.5,
+    penalty: float = DEFAULT_PENALTY,
     mult: float = 1.4142135623730951,
     ash_init: bool = True,
     ash_threshold: float = 1e-6,

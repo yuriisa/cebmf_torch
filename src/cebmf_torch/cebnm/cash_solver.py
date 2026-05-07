@@ -67,7 +67,7 @@ class CashNet(nn.Module):
 
 
 # Custom loss function
-def pen_loglik_loss(pred_pi, marginal_log_lik, penalty=1.5, epsilon=1e-10):
+def pen_loglik_loss(pred_pi, marginal_log_lik, penalty=1.0, epsilon=1e-10):
     L_batch = torch.exp(marginal_log_lik)  # (B, K)
     inner_sum = torch.sum(pred_pi * L_batch, dim=1)  # (B,)
     inner_sum = torch.clamp(inner_sum, min=epsilon)
@@ -357,7 +357,7 @@ def cash_posterior_means(
     batch_size=128,
     lr=0.001,
     model_param=None,
-    penalty=1.5,
+    penalty=1.0,
     device: torch.device | None = None,
 ):
     """

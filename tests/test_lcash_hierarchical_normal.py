@@ -469,6 +469,14 @@ def test_propodds_normal_prior_smoke():
     mu = w_true[X_cat[:, 0]]
     betahat = mu + se * torch.randn(n, generator=g)
 
+    # Pass penalty=1.5 explicitly: this smoke test is short (n_epochs=80)
+    # and relies on the Dirichlet spike penalty to force per-trait logit
+    # shifts to differentiate enough that the E-step fits tau2 above the
+    # floor. Under the library default (penalty=1.0) the model can express
+    # null-fraction information via the slab weights and the per-trait
+    # logit shifts collapse, making tau2 hit the floor on this synthetic
+    # config. Passing penalty=1.5 here preserves the smoke-check intent
+    # without coupling it to the global default.
     res = po_lcash_posterior_means(
         None,
         betahat,
@@ -479,6 +487,7 @@ def test_propodds_normal_prior_smoke():
         n_epochs=80,
         prior_warmup_epochs=20,
         prior_refit_every=10,
+        penalty=1.5,
         verbose=False,
         seed=42,
         device=torch.device("cpu"),
