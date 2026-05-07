@@ -15,8 +15,9 @@ import math
 
 import torch
 
-from cebmf_torch.cebnm.cash_solver import cash_posterior_means
+from cebmf_torch.cebnm.cash_solver import DEFAULT_PENALTY, cash_posterior_means
 from cebmf_torch.cebnm.lcash import lcash_posterior_means, po_lcash_posterior_means
+from cebmf_torch.cebnm.lcash import DEFAULT_PENALTY as LCASH_DEFAULT_PENALTY
 
 
 def _proper_marginal_loglik(betahat, sebetahat, scale, pi):
@@ -137,3 +138,43 @@ def test_cash_loss_equals_negative_marginal_loglik_penalty1():
     # rebuild the proper marginal from res.pi_np and res.scale.
     proper_ll = _proper_marginal_loglik(x, s, res.scale, res.pi_np)
     assert abs(res.loss - (-proper_ll)) < 1e-3
+
+
+def test_default_penalty_constant_is_single_source_of_truth():
+    """The Dirichlet spike penalty default is defined exactly once.
+
+    `cebmf_torch.cebnm.cash_solver.DEFAULT_PENALTY` is the source of truth.
+    `cebmf_torch.cebnm.lcash.DEFAULT_PENALTY` re-exports the same object.
+    Both are equal to 1.0, the convention of R `ashr` (no Dirichlet penalty).
+    Calling `lcash_posterior_means` without an explicit `penalty` kwarg
+    must produce numerically identical posteriors to calling it with
+    `penalty=DEFAULT_PENALTY` explicitly. This protects the implicit-default
+    path that the existing tests do not cover (they pass `penalty=1.0`
+    explicitly).
+    """
+    # Single source of truth: the constant is the same object after
+    # re-export from cash_solver into lcash.
+    assert DEFAULT_PENALTY is LCASH_DEFAULT_PENALTY
+    assert DEFAULT_PENALTY == 1.0
+
+    X, x, s = _make_data(n=600)
+    common = dict(
+        X=X,
+        betahat=x,
+        sebetahat=s,
+        n_epochs=10,
+        batch_size=512,
+        ash_init=True,
+        verbose=False,
+        device=torch.device("cpu"),
+        seed=42,
+    )
+    # Implicit default ...
+    res_implicit = lcash_posterior_means(**common)
+    # ... must match explicit DEFAULT_PENALTY.
+    res_explicit = lcash_posterior_means(penalty=DEFAULT_PENALTY, **common)
+    torch.testing.assert_close(res_implicit.post_mean, res_explicit.post_mean,
+                                rtol=1e-12, atol=1e-12)
+    torch.testing.assert_close(res_implicit.pi_np, res_explicit.pi_np,
+                                rtol=1e-12, atol=1e-12)
+    assert math.isclose(res_implicit.loss, res_explicit.loss, rel_tol=1e-12)

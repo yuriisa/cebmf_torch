@@ -22,6 +22,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from cebmf_torch.cebnm.cash_solver import (
+    DEFAULT_PENALTY,
     cash_PosteriorMeanNorm,
     pen_loglik_loss,
 )
@@ -29,18 +30,11 @@ from cebmf_torch.ebnm.ash import PriorType, ash
 from cebmf_torch.utils.distribution_operation import get_data_loglik_normal_torch
 from cebmf_torch.utils.mixture import autoselect_scales_mix_norm
 
-# ---------------------------------------------------------------------------
-# Module-level defaults (single source of truth).
-# ---------------------------------------------------------------------------
-# Public entry points and the internal worker share many kwargs; defaults are
-# defined once here and referenced from each signature so they cannot drift.
-# Add to this list as duplications are detected.
-
-#: Dirichlet pseudo-count on the spike component of the mixture-weight prior.
-#: ``1.0`` is uniform / no penalty (the convention of R ``ashr``).
-#: Values ``> 1`` add ``penalty - 1`` fictitious "fully null" observations
-#: per gene before fitting and bias the spike weight upward.
-DEFAULT_PENALTY: float = 1.0
+# ``DEFAULT_PENALTY`` is the single source of truth for the Dirichlet spike
+# pseudo-count, defined in :mod:`cebmf_torch.cebnm.cash_solver` and re-exported
+# here. All five callsites in the cash/lcash family reference the same constant.
+# See :data:`cebmf_torch.cebnm.cash_solver.DEFAULT_PENALTY` for the full
+# description.
 
 # ============================================================
 # Model classes

@@ -8,6 +8,24 @@ from cebmf_torch.utils.mixture import autoselect_scales_mix_norm
 from cebmf_torch.utils.posterior import posterior_mean_norm
 from cebmf_torch.utils.standard_scaler import standard_scale
 
+# ---------------------------------------------------------------------------
+# Module-level defaults (single source of truth).
+# ---------------------------------------------------------------------------
+
+#: Dirichlet pseudo-count on the spike component of the mixture-weight prior
+#: shared by every callsite in the cash/lcash family
+#: (:func:`pen_loglik_loss`, :func:`cash_posterior_means`,
+#: :func:`cebmf_torch.cebnm.lcash.lcash_posterior_means`,
+#: :func:`cebmf_torch.cebnm.lcash.po_lcash_posterior_means`,
+#: and the internal :func:`cebmf_torch.cebnm.lcash._fit_lcash`).
+#:
+#: ``1.0`` is uniform / no penalty (the convention of R ``ashr``).
+#: Values ``> 1`` add ``penalty - 1`` fictitious "fully null" observations
+#: per gene before fitting and bias the spike weight upward; this can
+#: improve held-out predictive density on data where most genes really are
+#: null but penalises data with many real effects.
+DEFAULT_PENALTY: float = 1.0
+
 
 # ---- Dataset: assumes tensors already on correct device/dtype
 class DensityRegressionDataset(Dataset):
@@ -67,7 +85,7 @@ class CashNet(nn.Module):
 
 
 # Custom loss function
-def pen_loglik_loss(pred_pi, marginal_log_lik, penalty=1.0, epsilon=1e-10):
+def pen_loglik_loss(pred_pi, marginal_log_lik, penalty=DEFAULT_PENALTY, epsilon=1e-10):
     L_batch = torch.exp(marginal_log_lik)  # (B, K)
     inner_sum = torch.sum(pred_pi * L_batch, dim=1)  # (B,)
     inner_sum = torch.clamp(inner_sum, min=epsilon)
@@ -357,7 +375,7 @@ def cash_posterior_means(
     batch_size=128,
     lr=0.001,
     model_param=None,
-    penalty=1.0,
+    penalty=DEFAULT_PENALTY,
     device: torch.device | None = None,
 ):
     """
@@ -389,7 +407,9 @@ def cash_posterior_means(
     model_param : dict, optional
         Pre-trained model parameters to initialize the network.
     penalty : float, optional
-        Penalty for spike probability (default=1.5).
+        Dirichlet spike penalty (lambda_pen). Default :data:`DEFAULT_PENALTY`
+        (= 1.0, no penalty; matches R ``ashr``). See :data:`DEFAULT_PENALTY`
+        for the trade-off and a fuller description.
 
     Returns
     -------
