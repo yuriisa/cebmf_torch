@@ -35,14 +35,39 @@ Notes on the level-2 hyperparameter ``tau_c^2``
 The level-2 prior on ``log c_t`` is a free-mean Normal
 ``N(mu_c, tau_c^2)`` with ``mu_c`` and ``log tau_c`` learnable
 parameters optimised jointly with everything else under a single
-Adam loop. The Normal log-density's ``-T*log(tau_c)`` normaliser
-provides a restoring gradient against ``tau_c -> 0`` that closed-form
-alternating empirical Bayes lacks. **However, this restoring force
-acts only when at least some per-trait ``log c_t`` values diverge from
-``mu_c``.** On panels where the data prefers a homogeneous solution
-(every ``c_t`` close to the panel mean), the level-2 quadratic term
-collapses to zero, the ``-T*log(tau_c)`` term dominates, and
-``tau_c^2`` shrinks to the ``tau2_min`` floor.
+Adam loop. The minimised loss (negative log-prior, summed over the
+``T`` traits) decomposes into two terms whose gradients on
+``log_tau_c`` act in opposite directions:
+
+* The normaliser ``+T * log(tau_c)``. Gradient ``+T``. In a
+  minimisation Adam moves ``log_tau_c`` *down*; this is the term
+  that drives ``tau_c -> 0``.
+* The quadratic residual ``+sum_t (log c_t - mu_c)^2 / (2 tau_c^2)``.
+  Gradient ``-sum_t (log c_t - mu_c)^2 / tau_c^2``. Adam moves
+  ``log_tau_c`` *up*. This is the term that resists collapse, and
+  it does so **only when per-trait ``log c_t`` values diverge from
+  ``mu_c``**.
+
+The two terms balance at ``tau_c^2 = (1/T) sum_t (log c_t - mu_c)^2``
+— the empirical-variance equilibrium. On panels where the data
+prefers a homogeneous solution (every ``c_t`` close to the panel
+mean), the quadratic term has nothing to push against, the
+normaliser dominates, and ``tau_c`` is driven toward zero. The
+``tau2_min`` parameter installs a soft floor (see below) to keep
+the optimisation numerically well-behaved when this happens. The
+practical advantage of joint Adam over closed-form alternating
+empirical Bayes is dynamic stability: alternating EB sets
+``tau_c^2`` to the empirical variance instantly each E-step and can
+oscillate or overshoot toward the floor when per-trait values are
+momentarily clustered; joint Adam smooths the trajectory.
+
+The floor is implemented smoothly as
+``tau_c = sqrt(tau2_min + exp(2 * log_tau_c))`` rather than as a
+hard ``clamp(min=sqrt(tau2_min))``. With the smooth floor,
+gradients on ``log_tau_c`` flow at all values, so if per-trait
+heterogeneity later emerges the optimiser can recover ``tau_c``
+above the floor; with a hard clamp the gradient through ``tau_c``
+is zero below the floor and recovery is impossible.
 
 This was observed by the CAESER 246-trait validation in both
 training directions: the per-trait ``c_t`` values clustered tightly
@@ -457,10 +482,11 @@ def s_lc_ash_posterior_means(
 
     over ``log_c`` (T,), ``logit_p`` (), ``eta`` (K,), ``mu_c`` (), and
     ``log_tau_c`` () jointly under a single Adam optimiser. The level-2
-    Normal log-density's ``-T*log(tau_c)`` normaliser provides the
-    restoring gradient against ``tau_c -> 0`` collapse that closed-form
-    alternating empirical Bayes lacks; see the module docstring for
-    panel-dependence caveats.
+    quadratic term ``+sum_t (log c_t - mu_c)^2 / (2 tau_c^2)`` resists
+    ``tau_c -> 0`` collapse when per-trait ``log c_t`` values diverge
+    from ``mu_c``; the ``+T*log(tau_c)`` normaliser drives ``tau_c``
+    down, and the two balance at ``tau_c^2 = empirical variance``. See
+    the module docstring for the panel-dependence caveats.
 
     Parameters
     ----------
@@ -556,7 +582,13 @@ def s_lc_ash_posterior_means(
         lr=lr,
         weight_decay=weight_decay,
     )
-    tau_floor = math.sqrt(max(tau2_min, 1e-300))
+    # Smooth floor on tau_c: tau_c = sqrt(tau2_min + exp(2 * log_tau_c)).
+    # At all values of log_tau_c the gradient flows; for very negative
+    # log_tau_c the formula asymptotes to sqrt(tau2_min) (the floor).
+    # A hard `clamp(min=...)` would zero the gradient through tau_c
+    # below the floor and prevent recovery if per-trait heterogeneity
+    # later emerges.
+    tau2_min_t = torch.tensor(max(tau2_min, 1e-300), dtype=torch.float64, device=device)
     history: list[dict] = []
     loglik_history: list[float] = []
     final_loss = float("nan")
@@ -566,10 +598,14 @@ def s_lc_ash_posterior_means(
             betahat, sebetahat, X_cat, model.log_c, model.logit_p, model.eta, model.sigma
         )
         data_loss = -log_m.sum()
-        tau_c = torch.exp(model.log_tau_c).clamp(min=tau_floor)
-        # Level-2 prior: log c_t ~ N(mu_c, tau_c^2). The log_prob includes
-        # the -T*log(tau_c) normaliser that provides the restoring force
-        # against tau_c -> 0 collapse.
+        # Level-2 prior: log c_t ~ N(mu_c, tau_c^2).
+        # Negative log-prob summed over T traits =
+        #   +T * log(tau_c)                    (drives tau_c down)
+        # + sum_t (log c_t - mu_c)^2 / (2 tau_c^2)  (resists tau_c -> 0
+        #                                          when log_c_t differs
+        #                                          from mu_c)
+        # plus a constant 0.5 * T * log(2*pi).
+        tau_c = torch.sqrt(tau2_min_t + torch.exp(2.0 * model.log_tau_c))
         pen = -Normal(loc=model.mu_c, scale=tau_c).log_prob(model.log_c).sum()
         loss = data_loss + pen
         loss.backward()
@@ -581,7 +617,7 @@ def s_lc_ash_posterior_means(
                 loglik_history.append(float(log_m.sum().item()))
         if (epoch + 1) % snapshot_every == 0 or epoch == n_epochs - 1:
             with torch.no_grad():
-                tau_c_eff = float(torch.exp(model.log_tau_c).clamp(min=tau_floor))
+                tau_c_eff = float(torch.sqrt(tau2_min_t + torch.exp(2.0 * model.log_tau_c)))
                 history.append(
                     {
                         "mu_c": float(model.mu_c),
@@ -598,7 +634,7 @@ def s_lc_ash_posterior_means(
 
     # ---- Final hyperparameters
     with torch.no_grad():
-        tau_c_eff = float(torch.exp(model.log_tau_c).clamp(min=tau_floor))
+        tau_c_eff = float(torch.sqrt(tau2_min_t + torch.exp(2.0 * model.log_tau_c)))
     psi = {
         "mu_c": float(model.mu_c),
         "tau2_c": tau_c_eff ** 2,
@@ -697,7 +733,15 @@ def fit_new_trait(
         ``tau_c`` (default 1.0). Larger values widen the prior on a new
         trait when the panel-fitted ``tau_c`` is too tight to represent
         deployment-time variability.
-    track_loglik_history, device, verbose, seed : standard kwargs.
+    track_loglik_history : bool, optional
+        Record per-closure-call data marginal log-likelihood. With
+        L-BFGS strong-Wolfe line search the closure runs multiple times
+        per outer iteration (each line-search probe), so the history is
+        indexed by closure call (line-search probe), NOT by outer
+        iteration or "epoch". Granularity is finer than the
+        :func:`s_lc_ash_posterior_means` history which is one entry per
+        Adam epoch.
+    device, verbose, seed : standard kwargs.
 
     Returns
     -------
@@ -767,10 +811,18 @@ def fit_new_trait(
                 loglik_history.append(float(log_m.sum().item()))
         return loss
 
+    # `final_loss` records the joint MAP objective at the optimum
+    # (data + prior penalty), matching the convention used by
+    # :func:`s_lc_ash_posterior_means`. We deliberately do NOT store
+    # `-marginal_loglik` here because that excludes the prior penalty
+    # and would be inconsistent with how the panel-fit `loss` field
+    # is interpreted.
     prev_loss = None
+    final_loss = float("nan")
     for _ in range(max(1, n_epochs // 20)):
         loss = optimizer.step(closure)
         cur = float(loss.item())
+        final_loss = cur
         if prev_loss is not None and abs(prev_loss - cur) < 1e-9:
             break
         prev_loss = cur
@@ -813,7 +865,7 @@ def fit_new_trait(
         post_sd=out["post_sd"].detach().cpu(),
         pi_np=out["pi_np"].detach().cpu(),
         scale=sigma.detach().cpu(),
-        loss=-marginal_loglik,
+        loss=final_loss,
         model_param={
             "log_c": log_c.detach().cpu(),
             "logit_p": logit_p.detach().cpu(),
