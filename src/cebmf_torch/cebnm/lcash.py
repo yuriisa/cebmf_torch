@@ -251,34 +251,52 @@ class PropOddsLcashNet(nn.Module):
 # ============================================================
 
 
-def _install_reference_gauge(net: nn.Module) -> None:
-    """Pin row 0 of every categorical embedding at zero.
+def _install_reference_gauge(
+    net: nn.Module,
+    reference_levels: list[int] | None = None,
+) -> None:
+    """Pin a chosen row of every categorical embedding at zero (gauge).
 
     Called once after ``net`` is constructed (and after any warm-start load
-    via ``model_param``).  The hook zeros the gradient on row 0 of each
-    categorical embedding.  Row 0 is also explicitly zeroed here, defensively,
-    in case a warm-start populated row 0 with non-zero values; without this
-    the gauge would pin row 0 at the loaded (non-zero) value.
+    via ``model_param``).  The hook zeros the gradient on the reference row
+    of each categorical embedding.  The reference row is also explicitly
+    zeroed here, defensively, in case a warm-start populated it with non-zero
+    values; without this the gauge would pin that row at the loaded
+    (non-zero) value.
 
     Works on both :class:`LcashNet` and :class:`PropOddsLcashNet` because
     both expose ``.cat`` as the ``nn.ModuleList`` of categorical embeddings.
+
+    Parameters
+    ----------
+    net : nn.Module
+        Network with ``.cat`` (an ``nn.ModuleList`` of embeddings).
+    reference_levels : list[int] or None
+        Per-column reference index. ``None`` means index 0 for all columns
+        (the original behaviour, for backwards compatibility). The list
+        must have one entry per categorical column.
 
     Assumption: the training loop calls ``optimizer.zero_grad()`` between
     backward passes (the standard PyTorch convention).  The hook clones
     ``grad`` to avoid in-place mutation of the autograd graph.
     """
-    for emb in net.cat:
+    refs = reference_levels if reference_levels is not None else [0] * len(net.cat)
+    if len(refs) != len(net.cat):
+        raise ValueError(f"reference_levels has length {len(refs)} but net has {len(net.cat)} categorical columns.")
+    for emb, ref in zip(net.cat, refs, strict=True):
         if emb.num_embeddings < 2:
             raise ValueError("Categorical column with fewer than 2 levels is degenerate.")
+        if not (0 <= ref < emb.num_embeddings):
+            raise ValueError(f"reference_level {ref} out of range for embedding with {emb.num_embeddings} levels.")
         with torch.no_grad():
-            emb.weight[0].zero_()  # defensive: handle warm-start case
+            emb.weight[ref].zero_()  # defensive: handle warm-start case
 
-        def _zero_row_zero(grad, _emb=emb):
+        def _zero_ref_row(grad, _ref=ref):
             grad = grad.clone()
-            grad[0].zero_()
+            grad[_ref].zero_()
             return grad
 
-        emb.weight.register_hook(_zero_row_zero)
+        emb.weight.register_hook(_zero_ref_row)
 
 
 # ============================================================
@@ -404,7 +422,14 @@ def _prepare_inputs(
     betahat: torch.Tensor,
     sebetahat: torch.Tensor,
     device: torch.device,
-) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor, torch.Tensor]:
+) -> tuple[
+    torch.Tensor | None,
+    torch.Tensor | None,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor | None,
+    torch.Tensor | None,
+]:
     """Convert inputs to tensors on device; standardise X (NaN-aware).
 
     Categorical inputs bypass standardisation entirely; they are only moved
@@ -414,30 +439,51 @@ def _prepare_inputs(
     on non-NaN values only, then NaN positions are zero-filled.  This
     ensures that missing features contribute nothing to the logits and
     that the statistics are not biased by the zero-fill.
+
+    Returns
+    -------
+    X_scaled, X_cat, betahat, sebetahat, x_means, x_stds
+        ``x_means`` and ``x_stds`` are the per-column NaN-aware statistics
+        used to standardise ``X``; both are ``None`` when ``X is None``.
+        These are cached on the result so :meth:`predict_pi` can apply
+        the same standardisation to held-out continuous covariates.
     """
     if X is not None:
         X = torch.as_tensor(X, dtype=torch.float32, device=device)
         if X.ndim == 1:
             X = X.reshape(-1, 1)
-        X_scaled = _nanstandardise(X)
+        X_scaled, x_means, x_stds = _nanstandardise(X)
     else:
         X_scaled = None
+        x_means = None
+        x_stds = None
 
     if X_cat is not None:
         X_cat = X_cat.to(device=device, dtype=torch.long)
 
     betahat = torch.as_tensor(betahat, dtype=torch.float32, device=device)
     sebetahat = torch.as_tensor(sebetahat, dtype=torch.float32, device=device)
-    return X_scaled, X_cat, betahat, sebetahat
+    return X_scaled, X_cat, betahat, sebetahat, x_means, x_stds
 
 
-def _nanstandardise(X: torch.Tensor) -> torch.Tensor:
+def _nanstandardise(X: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Standardise columns using non-NaN values, then zero-fill NaN.
 
     Vectorised implementation. For each column, compute mean and
     population std on observed (non-NaN) entries, standardise observed
     values, and set NaN positions to 0. Columns with zero std
     (constant or all-NaN) are set to 0.
+
+    Returns
+    -------
+    X_out, mu, sd
+        ``X_out`` is the standardised matrix (NaN positions zero-filled).
+        ``mu`` and ``sd`` are the per-column means and population standard
+        deviations on observed values, used to apply the same
+        standardisation at inference time via :func:`_apply_nanstandardise`.
+        For columns with zero std (constant or all-NaN) we still report
+        the raw mean and a zero std; :func:`_apply_nanstandardise` handles
+        the zero-std case by zero-filling.
     """
     mask = ~torch.isnan(X)
     counts = mask.sum(dim=0)  # (F,)
@@ -458,6 +504,39 @@ def _nanstandardise(X: torch.Tensor) -> torch.Tensor:
     safe_sd = torch.where((sd > 0) & (counts > 1), sd, torch.ones_like(sd))
     X_out = torch.where(
         mask & (sd > 0).unsqueeze(0) & (counts > 1).unsqueeze(0),
+        diff / safe_sd,
+        torch.zeros_like(X),
+    )
+    return X_out, mu, sd
+
+
+def _apply_nanstandardise(
+    X: torch.Tensor,
+    mu: torch.Tensor,
+    sd: torch.Tensor,
+) -> torch.Tensor:
+    """Apply NaN-aware standardisation using externally-provided stats.
+
+    Mirrors the zero-fill behaviour of :func:`_nanstandardise`: NaN
+    positions are zero-filled after centring/scaling, and columns with
+    zero std (or non-finite mu/sd) are zero-filled entirely. Used at
+    inference time by :meth:`cash_PosteriorMeanNorm.predict_pi` so that
+    held-out covariates are standardised against the training statistics
+    and not against per-cohort statistics (which would induce silent
+    covariate shift).
+    """
+    if X.shape[1] != mu.shape[0]:
+        raise ValueError(
+            f"X has {X.shape[1]} columns but cached x_means has {mu.shape[0]}; "
+            "the new X must match the training X column count."
+        )
+    mu = mu.to(device=X.device, dtype=X.dtype)
+    sd = sd.to(device=X.device, dtype=X.dtype)
+    mask = ~torch.isnan(X)
+    diff = torch.where(mask, X - mu, torch.zeros_like(X))
+    safe_sd = torch.where(sd > 0, sd, torch.ones_like(sd))
+    X_out = torch.where(
+        mask & (sd > 0).unsqueeze(0),
         diff / safe_sd,
         torch.zeros_like(X),
     )
@@ -578,6 +657,7 @@ def _train_model(
     prior_refit_every: int = 10,
     tau2_min: float = 1e-6,
     prior_tol: float | None = 0.01,
+    reference_levels: list[int] | None = None,
 ) -> tuple[float, dict, list[dict]]:
     """Run the training loop.
 
@@ -614,6 +694,11 @@ def _train_model(
     breaks before consuming the remaining ``n_epochs`` budget). The
     first E-step has no predecessor and therefore cannot trigger
     early-stopping by itself.
+
+    ``reference_levels`` selects which row of each categorical embedding
+    is the gauge-pinned reference (excluded from the M-step regulariser
+    and the E-step coefficient set). ``None`` defaults to row 0 for all
+    categorical columns (backwards-compatible behaviour).
     """
     model.train()
     if X_scaled is not None:
@@ -649,6 +734,18 @@ def _train_model(
     # Counter of consecutive E-steps whose max log(tau2)-change fell
     # below prior_tol. Triggers early-stopping when it reaches 2.
     consecutive_below_tol = 0
+
+    # Resolve reference levels (default: row 0 for every categorical
+    # column). The list aligns with model.cat order.
+    n_cat = len(getattr(model, "cat", []))
+    if reference_levels is None:
+        refs = [0] * n_cat
+    else:
+        if len(reference_levels) != n_cat:
+            raise ValueError(
+                f"reference_levels has length {len(reference_levels)} but model has {n_cat} categorical columns."
+            )
+        refs = list(reference_levels)
 
     # Outer alternating loop. When cat_prior is None, n_outer == 1 and
     # epochs_this_iter == n_epochs, so we recover the original loop.
@@ -688,9 +785,14 @@ def _train_model(
                         if prior_name is None or d not in priors_state:
                             continue
                         psi = priors_state[d]
-                        # Row 0 is gauge-pinned and excluded from the regulariser
-                        # (Section 6.5). Slice with grad-flow.
-                        coeffs = model.cat[d].weight[1:]
+                        # The reference row is gauge-pinned and excluded
+                        # from the regulariser (Section 6.5). Slice with
+                        # grad-flow over a boolean mask.
+                        ref_d = refs[d]
+                        T_d = model.cat[d].num_embeddings
+                        keep_mask = torch.ones(T_d, dtype=torch.bool, device=model.cat[d].weight.device)
+                        keep_mask[ref_d] = False
+                        coeffs = model.cat[d].weight[keep_mask]
                         if prior_name == "normal":
                             R = -logp_normal(coeffs, psi)
                         else:
@@ -717,10 +819,15 @@ def _train_model(
             for d, prior_name in enumerate(cat_prior):
                 if prior_name is None:
                     continue
-                # Detach and flatten over rows 1..T_d-1 (and across all K
-                # output classes for LcashNet, or the single scalar column
-                # for PropOddsLcashNet -- both shapes flatten the same way).
-                coeffs = model.cat[d].weight[1:].detach().flatten()
+                # Detach and flatten over all rows except the reference
+                # (which is gauge-pinned at zero). Both LcashNet (K-wide
+                # rows) and PropOddsLcashNet (scalar rows) flatten the
+                # same way.
+                ref_d = refs[d]
+                T_d = model.cat[d].num_embeddings
+                keep_mask = torch.ones(T_d, dtype=torch.bool, device=model.cat[d].weight.device)
+                keep_mask[ref_d] = False
+                coeffs = model.cat[d].weight[keep_mask].detach().flatten()
                 if prior_name == "normal":
                     psi = fit_normal(coeffs, tau2_min=tau2_min)
                 else:
@@ -903,6 +1010,37 @@ def _resolve_weight_decay(weight_decay: float | None, cat_prior_list: list[str |
     return weight_decay
 
 
+def _resolve_reference_levels(
+    reference_level: int | list[int] | None,
+    cat_levels: list[int] | None,
+) -> list[int] | None:
+    """Promote ``reference_level`` to a per-column list (or None).
+
+    Returns ``None`` when no categorical columns are present (so the
+    gauge installer takes its default backwards-compatible path) or when
+    ``reference_level`` is ``None`` (caller-side default of row 0 across
+    all columns). An ``int`` is broadcast across all columns; a list
+    must have one entry per categorical column. Per-column bounds are
+    validated against ``cat_levels``.
+    """
+    if cat_levels is None or len(cat_levels) == 0:
+        if reference_level is not None:
+            raise ValueError("reference_level was given but X_cat is None / has no columns.")
+        return None
+    if reference_level is None:
+        return None
+    if isinstance(reference_level, int):
+        refs = [reference_level] * len(cat_levels)
+    else:
+        refs = list(reference_level)
+    if len(refs) != len(cat_levels):
+        raise ValueError(f"reference_level has length {len(refs)} but X_cat has {len(cat_levels)} columns.")
+    for d, (r, T_d) in enumerate(zip(refs, cat_levels, strict=True)):
+        if not (0 <= r < T_d):
+            raise ValueError(f"reference_level[{d}]={r} out of range for {T_d} levels.")
+    return refs
+
+
 def _fit_lcash(
     X: torch.Tensor | None,
     betahat: torch.Tensor,
@@ -928,6 +1066,7 @@ def _fit_lcash(
     prior_refit_every: int = 10,
     tau2_min: float = 1e-6,
     prior_tol: float | None = 0.01,
+    reference_level: int | list[int] | None = None,
 ) -> cash_PosteriorMeanNorm:
     """Shared implementation for both softmax and proportional odds LC-ASH.
 
@@ -945,7 +1084,7 @@ def _fit_lcash(
         n_epochs = 200
 
     X_cat, cat_levels = _validate_inputs(X, X_cat, n_cat_levels)
-    X_scaled, X_cat, betahat, sebetahat = _prepare_inputs(X, X_cat, betahat, sebetahat, device)
+    X_scaled, X_cat, betahat, sebetahat, x_means, x_stds = _prepare_inputs(X, X_cat, betahat, sebetahat, device)
     scale, log_pi_init = _select_grid(betahat, sebetahat, mult, ash_init, ash_threshold, device)
 
     # Normalise cat_prior to a list[str|None] (or None) of length F_d.
@@ -953,6 +1092,7 @@ def _fit_lcash(
     cat_prior_list = _normalise_cat_prior(cat_prior, n_cat_cols)
 
     weight_decay = _resolve_weight_decay(weight_decay, cat_prior_list)
+    reference_levels = _resolve_reference_levels(reference_level, cat_levels)
 
     # Local RNG for reproducible weight init and batch ordering.
     # Does not mutate global torch RNG state.
@@ -970,7 +1110,7 @@ def _fit_lcash(
     ).to(device)
     _warm_start(model, model_param, label)
     if cat_levels:
-        _install_reference_gauge(model)
+        _install_reference_gauge(model, reference_levels=reference_levels)
 
     optimizer = _build_optimizer(model, model_class, weight_decay=weight_decay, lr=lr)
 
@@ -993,6 +1133,7 @@ def _fit_lcash(
         prior_refit_every=prior_refit_every,
         tau2_min=tau2_min,
         prior_tol=prior_tol,
+        reference_levels=reference_levels,
     )
 
     post_mean, post_mean2, post_sd, all_pi_values, marginal_loglik = _compute_posteriors(
@@ -1032,6 +1173,8 @@ def _fit_lcash(
     # fitted prior, *without* the spike Dirichlet penalty. This matches
     # the convention used by `cebnm/emdn.py` and is the meaning required
     # by `cebmf.py`'s per-factor `kl_l[k] = (-loss) - nm_ll_L` formula.
+    # ``marginal_loglik`` is exposed as an explicit field so users do not
+    # have to invert the sign on ``loss`` to track convergence.
     return cash_PosteriorMeanNorm(
         post_mean=post_mean,
         post_mean2=post_mean2,
@@ -1042,6 +1185,9 @@ def _fit_lcash(
         model_param=model.state_dict(),
         priors_fitted=priors_fitted,
         priors_fitted_history=priors_fitted_history,
+        marginal_loglik=marginal_loglik,
+        x_means=x_means,
+        x_stds=x_stds,
     )
 
 
@@ -1074,6 +1220,7 @@ def lcash_posterior_means(
     prior_refit_every: int = 10,
     tau2_min: float = 1e-6,
     prior_tol: float | None = 0.01,
+    reference_level: int | list[int] | None = None,
 ) -> cash_PosteriorMeanNorm:
     """LC-ASH: linear covariate-modulated mixture weights.
 
@@ -1166,6 +1313,19 @@ def lcash_posterior_means(
         E-steps (across all active categorical columns), training exits
         early without consuming the remaining ``n_epochs`` budget. Set
         to ``None`` to disable early stopping. Default 0.01.
+    reference_level : int, list of int, or None, keyword-only
+        Index of the categorical level pinned at zero (the reference) for
+        each categorical column. ``None`` (default) means index 0 for all
+        columns. An int applies the same reference to every categorical
+        column. A list must have one int per categorical column.
+
+        NOTE: The choice of reference level is a gauge fixing; it does
+        not affect predictive output but it DOES affect the fitted
+        Level-2 ``tau2`` (because tau2 = mean of squared shifts relative
+        to the reference). For interpretability of ``tau2`` as "spread
+        of trait shifts around the average trait", choosing a near-mean
+        or near-median trait as the reference is more meaningful than
+        an arbitrary first-position trait.
 
     Returns
     -------
@@ -1174,9 +1334,11 @@ def lcash_posterior_means(
         scale (K,), loss, model_param (state dict for warm-starting),
         priors_fitted (dict of fitted Level-2 hyperparameters keyed by
         categorical column index, or ``None`` when ``cat_prior`` is unset),
-        and priors_fitted_history (per-E-step list of snapshots, or
+        priors_fitted_history (per-E-step list of snapshots, or
         ``None`` when no E-step ever fires; useful for diagnosing whether
-        ``tau2`` has stabilised by end of training).
+        ``tau2`` has stabilised by end of training), and
+        marginal_loglik (the full-data marginal log-likelihood under
+        the fitted prior, equivalently ``-loss``).
     """
     return _fit_lcash(
         X,
@@ -1203,6 +1365,7 @@ def lcash_posterior_means(
         prior_refit_every=prior_refit_every,
         tau2_min=tau2_min,
         prior_tol=prior_tol,
+        reference_level=reference_level,
     )
 
 
@@ -1230,6 +1393,7 @@ def po_lcash_posterior_means(
     prior_refit_every: int = 10,
     tau2_min: float = 1e-6,
     prior_tol: float | None = 0.01,
+    reference_level: int | list[int] | None = None,
 ) -> cash_PosteriorMeanNorm:
     """Proportional odds LC-ASH: ordered logistic covariate-modulated weights.
 
@@ -1253,7 +1417,8 @@ def po_lcash_posterior_means(
     betahat, sebetahat, n_epochs, batch_size, lr, weight_decay, penalty,
     mult, ash_init, ash_threshold, model_param, device, verbose, seed :
         See :func:`lcash_posterior_means`.
-    X_cat, n_cat_levels, cat_prior, prior_warmup_epochs, prior_refit_every, tau2_min, prior_tol :
+    X_cat, n_cat_levels, cat_prior, prior_warmup_epochs, prior_refit_every,
+    tau2_min, prior_tol, reference_level :
         See :func:`lcash_posterior_means`.
 
     Returns
@@ -1262,7 +1427,9 @@ def po_lcash_posterior_means(
         Container with post_mean, post_mean2, post_sd, pi_np (G, K),
         scale (K,), loss, model_param (state dict for warm-starting),
         priors_fitted (dict of fitted Level-2 hyperparameters or ``None``),
-        and priors_fitted_history (per-E-step list of snapshots, or ``None``).
+        priors_fitted_history (per-E-step list of snapshots, or ``None``),
+        and marginal_loglik (the full-data marginal log-likelihood under
+        the fitted prior, equivalently ``-loss``).
     """
     return _fit_lcash(
         X,
@@ -1289,4 +1456,5 @@ def po_lcash_posterior_means(
         prior_refit_every=prior_refit_every,
         tau2_min=tau2_min,
         prior_tol=prior_tol,
+        reference_level=reference_level,
     )

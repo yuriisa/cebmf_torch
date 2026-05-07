@@ -705,3 +705,429 @@ def test_prior_tol_disabled():
     )
     assert res.priors_fitted_history is not None
     assert len(res.priors_fitted_history) == n_epochs // refit
+
+
+# ---------------------------------------------------------------------------
+# Batch-B field-test follow-ups: predict_pi, reference_level, marginal_loglik
+# ---------------------------------------------------------------------------
+
+
+def test_predict_pi_categorical_only():
+    """Fit categorical-only; predict_pi reproduces training pi for matching categories."""
+    torch.manual_seed(0)
+    X_cat, betahat, se, _ = _simulate_per_trait(
+        n_per_trait=80, n_signal=3, n_null=7, signal_sd=2.0, obs_sd=0.5, seed=0
+    )
+    T = 10
+
+    res = lcash_posterior_means(
+        X=None,
+        betahat=betahat,
+        sebetahat=se,
+        n_epochs=40,
+        batch_size=512,
+        lr=1e-2,
+        penalty=1.0,
+        ash_init=True,
+        verbose=False,
+        device=torch.device("cpu"),
+        seed=42,
+        X_cat=X_cat,
+        n_cat_levels=T,
+        cat_prior=["normal"],
+        prior_warmup_epochs=20,
+        prior_refit_every=10,
+    )
+
+    K = res.scale.shape[0]
+
+    # Held-out indices: a permutation of training indices, plus repeats.
+    X_cat_new = torch.tensor([[0], [1], [2], [3], [4], [5], [6], [7], [8], [9], [4], [4]], dtype=torch.long)
+    pi_new = res.predict_pi(X_cat=X_cat_new)
+
+    # Shape and basic sanity.
+    assert pi_new.shape == (X_cat_new.shape[0], K)
+    assert torch.isfinite(pi_new).all()
+    row_sums = pi_new.sum(dim=1)
+    assert torch.allclose(row_sums, torch.ones_like(row_sums), atol=1e-5)
+
+    # For each training-known category, predict_pi must match the training pi.
+    for t in range(T):
+        mask = X_cat[:, 0] == t
+        # All rows with the same categorical level share the same pi vector.
+        train_pi_t = res.pi_np[mask][0]
+        new_pi_t = pi_new[X_cat_new[:, 0] == t]
+        for row in new_pi_t:
+            assert torch.allclose(row, train_pi_t, atol=1e-5), f"predict_pi(category={t}) does not match training pi"
+
+
+def test_predict_pi_continuous_only():
+    """Fit continuous-only; predict_pi handles standardisation internally."""
+    torch.manual_seed(0)
+    g = torch.Generator().manual_seed(0)
+    n = 800
+    F = 3
+    # Mean-shifted, non-unit-variance covariates.
+    X = 5.0 + 2.0 * torch.randn(n, F, generator=g)
+    true_b = torch.tensor([0.5, -0.3, 0.0])
+    eta = X @ true_b
+    se = torch.full((n,), 0.5)
+    betahat = eta + se * torch.randn(n, generator=g)
+
+    res = lcash_posterior_means(
+        X=X,
+        betahat=betahat,
+        sebetahat=se,
+        n_epochs=30,
+        batch_size=512,
+        lr=1e-2,
+        penalty=1.0,
+        ash_init=True,
+        verbose=False,
+        device=torch.device("cpu"),
+        seed=42,
+    )
+
+    K = res.scale.shape[0]
+    assert res._x_means is not None and res._x_stds is not None
+
+    # New raw X_new on a similar scale.
+    g2 = torch.Generator().manual_seed(1)
+    X_new = 5.0 + 2.0 * torch.randn(20, F, generator=g2)
+
+    # Pass raw X.
+    pi_raw = res.predict_pi(X=X_new)
+    assert pi_raw.shape == (X_new.shape[0], K)
+    row_sums = pi_raw.sum(dim=1)
+    assert torch.allclose(row_sums, torch.ones_like(row_sums), atol=1e-5)
+    assert torch.isfinite(pi_raw).all()
+
+    # Pre-standardise manually using training stats.
+    x_means = res._x_means
+    x_stds = res._x_stds
+    safe_sd = torch.where(x_stds > 0, x_stds, torch.ones_like(x_stds))
+    X_new_std = (X_new - x_means) / safe_sd
+    # Build a fresh result that trusts the caller's standardised X by stripping
+    # cached stats and forcing the path to check error semantics. Instead, we
+    # demonstrate equality by directly reconstructing the trained network and
+    # running it on the manually-standardised X.
+    from cebmf_torch.cebnm.lcash import LcashNet
+
+    net = LcashNet(cont_dim=F, num_classes=K, cat_n_levels=None)
+    net.load_state_dict(res.model_param)
+    net.eval()
+    with torch.no_grad():
+        pi_manual = net(X_new_std, None)
+    # predict_pi(raw X) must match running the net on the manually-standardised X.
+    assert torch.allclose(pi_raw, pi_manual, atol=1e-6)
+
+
+def test_predict_pi_mixed_continuous_categorical():
+    """Smoke test with both heads."""
+    torch.manual_seed(0)
+    g = torch.Generator().manual_seed(0)
+    n = 600
+    F = 2
+    T = 5
+
+    X = torch.randn(n, F, generator=g)
+    X_cat = torch.randint(0, T, (n, 1), generator=g, dtype=torch.long)
+    se = torch.full((n,), 0.4)
+    betahat = X[:, 0] + 0.5 * (X_cat[:, 0].float()) + se * torch.randn(n, generator=g)
+
+    res = lcash_posterior_means(
+        X=X,
+        betahat=betahat,
+        sebetahat=se,
+        n_epochs=30,
+        batch_size=512,
+        lr=1e-2,
+        penalty=1.0,
+        ash_init=True,
+        verbose=False,
+        device=torch.device("cpu"),
+        seed=42,
+        X_cat=X_cat,
+        n_cat_levels=T,
+    )
+
+    K = res.scale.shape[0]
+    g2 = torch.Generator().manual_seed(2)
+    X_new = torch.randn(15, F, generator=g2)
+    X_cat_new = torch.randint(0, T, (15, 1), generator=g2, dtype=torch.long)
+
+    pi_new = res.predict_pi(X=X_new, X_cat=X_cat_new)
+    assert pi_new.shape == (15, K)
+    row_sums = pi_new.sum(dim=1)
+    assert torch.allclose(row_sums, torch.ones_like(row_sums), atol=1e-5)
+    assert torch.isfinite(pi_new).all()
+
+
+def test_predict_pi_validates_inputs():
+    """Train cat-only; calling predict_pi(X=...) without X_cat should error."""
+    torch.manual_seed(0)
+    X_cat, betahat, se, _ = _simulate_per_trait(
+        n_per_trait=60, n_signal=2, n_null=8, signal_sd=2.0, obs_sd=0.5, seed=0
+    )
+
+    res = lcash_posterior_means(
+        X=None,
+        betahat=betahat,
+        sebetahat=se,
+        n_epochs=20,
+        batch_size=512,
+        lr=1e-2,
+        penalty=1.0,
+        ash_init=True,
+        verbose=False,
+        device=torch.device("cpu"),
+        seed=42,
+        X_cat=X_cat,
+        n_cat_levels=10,
+    )
+
+    # Missing X_cat (and no X) -> ValueError on "at least one of X, X_cat".
+    import pytest
+
+    with pytest.raises(ValueError):
+        res.predict_pi()
+    # Wrong head: X without X_cat for a cat-only model.
+    with pytest.raises(ValueError):
+        res.predict_pi(X=torch.randn(3, 1))
+    # Out-of-range categorical index.
+    with pytest.raises(ValueError):
+        res.predict_pi(X_cat=torch.tensor([[99]], dtype=torch.long))
+
+
+def test_reference_level_changes_tau2_but_not_pi():
+    """Gauge invariance: predictive pi approximately unchanged, but tau2 shifts.
+
+    The claim is exact at the population optimum: any change of gauge
+    leaves predictions invariant (softmax is shift-invariant in its
+    logits). With a stochastic mini-batch optimiser the two fits do not
+    end at the same point, so we test (a) the gauge has a measurable
+    effect on ``tau2`` (because tau2 = mean of squared shifts relative to
+    the reference) and (b) the predictions agree to within
+    optimisation-tolerance bounds rather than to machine precision.
+    """
+    torch.manual_seed(0)
+    # Use a simulation where multiple traits actually carry signal; a uniform
+    # null prior would give every trait coefficient near zero and tau2 invariant
+    # to the gauge choice.
+    X_cat, betahat, se, _ = _simulate_per_trait(
+        n_per_trait=80, n_signal=8, n_null=2, signal_sd=2.5, obs_sd=0.4, seed=11
+    )
+    T = 10
+
+    common = {
+        "X": None,
+        "betahat": betahat,
+        "sebetahat": se,
+        "n_epochs": 120,
+        "batch_size": 512,
+        "lr": 1e-2,
+        "penalty": 1.0,
+        "ash_init": True,
+        "verbose": False,
+        "device": torch.device("cpu"),
+        "seed": 42,
+        "X_cat": X_cat,
+        "n_cat_levels": T,
+        "cat_prior": ["normal"],
+        "prior_warmup_epochs": 5,
+        "prior_refit_every": 10,
+        "prior_tol": None,
+    }
+
+    res0 = lcash_posterior_means(**common, reference_level=0)
+    res5 = lcash_posterior_means(**common, reference_level=5)
+
+    tau2_0 = res0.priors_fitted[0]["tau2"]
+    tau2_5 = res5.priors_fitted[0]["tau2"]
+    print(f"tau2 (ref=0) = {tau2_0:.4f}, tau2 (ref=5) = {tau2_5:.4f}")
+    # Different gauges yield different tau2 estimates (Section 6.5 / B3 note).
+    assert not math.isclose(tau2_0, tau2_5, rel_tol=1e-2), (
+        f"reference_level should affect tau2 (got {tau2_0} vs {tau2_5})"
+    )
+
+    # Predictive pi is gauge-invariant in the population optimum.
+    # Two stochastic fits reach approximately the same predictions, modulo
+    # mini-batch SGD trajectory variance. Use a generous numerical tolerance
+    # that captures "nearly identical" rather than "machine precision".
+    X_cat_new = torch.arange(T, dtype=torch.long).reshape(-1, 1)
+    pi_a = res0.predict_pi(X_cat=X_cat_new)
+    pi_b = res5.predict_pi(X_cat=X_cat_new)
+    diff = (pi_a - pi_b).abs().max().item()
+    print(f"max |pi_a - pi_b| across all (level, K) = {diff:.4e}")
+    assert diff < 0.25, f"predictive pi differs too much across gauge choices: {diff}"
+
+    # Stronger test: the *exact* gauge invariance claim. Take the trained
+    # network from res0, manually re-gauge it to reference index 5 by
+    # subtracting emb[5] from every row of emb and adding emb[5] to bias,
+    # and confirm predictions are bit-identical. Softmax is invariant to
+    # shifting all logits by the same vector.
+    from cebmf_torch.cebnm.lcash import LcashNet
+
+    K = res0.scale.shape[0]
+    state0 = res0.model_param
+
+    net0 = LcashNet(cont_dim=0, num_classes=K, cat_n_levels=[T])
+    net0.load_state_dict(state0)
+    net0.eval()
+    with torch.no_grad():
+        pi_orig = net0(None, X_cat_new)
+
+    # Re-gauge: shift emb so that row 5 is zero.
+    emb = state0["cat.0.weight"].clone()
+    shift = emb[5].clone()
+    emb_regauged = emb - shift
+    bias_regauged = state0["bias"].clone() + shift
+    state_regauged = {
+        "cat.0.weight": emb_regauged,
+        "bias": bias_regauged,
+    }
+    net1 = LcashNet(cont_dim=0, num_classes=K, cat_n_levels=[T])
+    net1.load_state_dict(state_regauged)
+    net1.eval()
+    with torch.no_grad():
+        pi_regauged = net1(None, X_cat_new)
+    # Re-gauging the *same* trained net to a different reference must give
+    # bit-identical (up to float32 rounding) predictions.
+    assert torch.allclose(pi_orig, pi_regauged, atol=1e-5), (
+        "Mathematical gauge invariance violated: re-gauging the same trained net should preserve predictions exactly"
+    )
+
+
+def test_reference_level_validates():
+    """``reference_level`` out-of-range or wrong-length raises ValueError."""
+    import pytest
+
+    torch.manual_seed(0)
+    X_cat, betahat, se, _ = _simulate_per_trait(
+        n_per_trait=20, n_signal=1, n_null=3, signal_sd=1.0, obs_sd=0.5, seed=0
+    )
+
+    common = {
+        "X": None,
+        "betahat": betahat,
+        "sebetahat": se,
+        "n_epochs": 5,
+        "batch_size": 512,
+        "lr": 1e-2,
+        "penalty": 1.0,
+        "ash_init": True,
+        "verbose": False,
+        "device": torch.device("cpu"),
+        "seed": 42,
+        "X_cat": X_cat,
+        "n_cat_levels": 4,
+    }
+    # Out of range index.
+    with pytest.raises(ValueError):
+        lcash_posterior_means(**common, reference_level=99)
+    # Wrong-length list (X_cat has 1 column).
+    with pytest.raises(ValueError):
+        lcash_posterior_means(**common, reference_level=[0, 1])
+    # reference_level set but no categorical columns.
+    with pytest.raises(ValueError):
+        lcash_posterior_means(
+            X=torch.randn(20, 1),
+            betahat=betahat,
+            sebetahat=se,
+            n_epochs=5,
+            verbose=False,
+            device=torch.device("cpu"),
+            reference_level=0,
+        )
+
+
+def test_marginal_loglik_field():
+    """``marginal_loglik`` is a finite float and equals ``-loss`` exactly."""
+    torch.manual_seed(0)
+    X_cat, betahat, se, _ = _simulate_per_trait(
+        n_per_trait=50, n_signal=2, n_null=8, signal_sd=2.0, obs_sd=0.5, seed=0
+    )
+
+    res = lcash_posterior_means(
+        X=None,
+        betahat=betahat,
+        sebetahat=se,
+        n_epochs=30,
+        batch_size=512,
+        lr=1e-2,
+        penalty=1.0,
+        ash_init=True,
+        verbose=False,
+        device=torch.device("cpu"),
+        seed=42,
+        X_cat=X_cat,
+        n_cat_levels=10,
+        cat_prior=["normal"],
+        prior_warmup_epochs=5,
+        prior_refit_every=10,
+    )
+
+    assert isinstance(res.marginal_loglik, float)
+    assert math.isfinite(res.marginal_loglik)
+    assert abs(res.marginal_loglik + res.loss) < 1e-6, (
+        f"marginal_loglik={res.marginal_loglik} and loss={res.loss} are not negatives of each other"
+    )
+
+
+def test_marginal_loglik_field_continuous():
+    """``marginal_loglik`` matches ``-loss`` on the continuous-only path too."""
+    torch.manual_seed(0)
+    g = torch.Generator().manual_seed(0)
+    n = 400
+    X = torch.randn(n, 2, generator=g)
+    se = torch.full((n,), 0.5)
+    betahat = X[:, 0] + se * torch.randn(n, generator=g)
+
+    res = lcash_posterior_means(
+        X=X,
+        betahat=betahat,
+        sebetahat=se,
+        n_epochs=30,
+        batch_size=512,
+        lr=1e-3,
+        penalty=1.0,
+        ash_init=True,
+        verbose=False,
+        device=torch.device("cpu"),
+        seed=42,
+    )
+
+    assert isinstance(res.marginal_loglik, float)
+    assert math.isfinite(res.marginal_loglik)
+    assert abs(res.marginal_loglik + res.loss) < 1e-6
+
+
+def test_predict_pi_propodds_smoke():
+    """predict_pi works for a PO-LC-ASH fit with categorical input."""
+    torch.manual_seed(0)
+    X_cat, betahat, se, _ = _simulate_per_trait(
+        n_per_trait=60, n_signal=3, n_null=7, signal_sd=2.0, obs_sd=0.5, seed=0
+    )
+    T = 10
+
+    res = po_lcash_posterior_means(
+        None,
+        betahat,
+        se,
+        X_cat=X_cat,
+        n_cat_levels=T,
+        cat_prior="normal",
+        n_epochs=40,
+        prior_warmup_epochs=10,
+        prior_refit_every=10,
+        verbose=False,
+        seed=42,
+        device=torch.device("cpu"),
+    )
+    K = res.scale.shape[0]
+    X_cat_new = torch.arange(T, dtype=torch.long).reshape(-1, 1)
+    pi_new = res.predict_pi(X_cat=X_cat_new)
+    assert pi_new.shape == (T, K)
+    row_sums = pi_new.sum(dim=1)
+    assert torch.allclose(row_sums, torch.ones_like(row_sums), atol=1e-4)
+    assert torch.isfinite(pi_new).all()
