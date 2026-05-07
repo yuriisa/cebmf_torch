@@ -98,6 +98,7 @@ class cash_PosteriorMeanNorm:
         marginal_loglik: float | None = None,
         x_means: torch.Tensor | None = None,
         x_stds: torch.Tensor | None = None,
+        _arch_meta: dict | None = None,
     ):
         """
         Container for the results of the CASH posterior mean estimation.
@@ -149,6 +150,15 @@ class cash_PosteriorMeanNorm:
             matrix used at training time, computed NaN-aware. Cached so
             that :meth:`predict_pi` can apply the same standardisation to
             new ``X``. ``None`` when no continuous covariates were given.
+        _arch_meta : dict or None, optional
+            Internal field; do not rely on. When populated by the LC-ASH
+            training entry points it carries the network architecture
+            metadata (``{"is_po": bool, "cont_dim": int, "cat_n_levels":
+            list[int]}``) needed by :meth:`predict_pi` to rebuild the
+            net without re-deriving the architecture from the
+            ``state_dict``. ``None`` is supported for backwards
+            compatibility with older pickled results; in that case
+            :meth:`predict_pi` falls back to ``state_dict`` introspection.
         """
         self.post_mean = post_mean
         self.post_mean2 = post_mean2
@@ -162,6 +172,7 @@ class cash_PosteriorMeanNorm:
         self.marginal_loglik = marginal_loglik
         self._x_means = x_means
         self._x_stds = x_stds
+        self._arch_meta = _arch_meta
 
     def predict_pi(
         self,
@@ -229,22 +240,33 @@ class cash_PosteriorMeanNorm:
         device = device or torch.device("cpu")
         state = self.model_param
 
-        # Detect architecture: PropOddsLcashNet exposes ``delta_1``;
-        # LcashNet exposes ``bias`` (and never ``delta_1``).
-        is_po = "delta_1" in state
-
-        # Determine cont_dim from cont.weight (LcashNet) or w (PO).
-        if is_po:
-            cont_dim = state["w"].shape[0] if "w" in state else 0
+        # Prefer architecture metadata cached at training time; fall back
+        # to ``state_dict`` introspection so older pickled results (which
+        # predate ``_arch_meta``) keep working unchanged.
+        arch_meta = getattr(self, "_arch_meta", None)
+        if arch_meta is not None:
+            is_po = arch_meta["is_po"]
+            cont_dim = arch_meta["cont_dim"]
+            cat_levels: list[int] = list(arch_meta["cat_n_levels"])
         else:
-            cont_dim = state["cont.weight"].shape[1] if "cont.weight" in state else 0
+            # Fallback: introspect state-dict (back-compat for older
+            # pickled ``cash_PosteriorMeanNorm`` instances).
+            # PropOddsLcashNet exposes ``delta_1``; LcashNet exposes
+            # ``bias`` (and never ``delta_1``).
+            is_po = "delta_1" in state
 
-        # Determine cat_n_levels by collecting cat.{d}.weight rows.
-        cat_levels: list[int] = []
-        d = 0
-        while f"cat.{d}.weight" in state:
-            cat_levels.append(state[f"cat.{d}.weight"].shape[0])
-            d += 1
+            # Determine cont_dim from cont.weight (LcashNet) or w (PO).
+            if is_po:
+                cont_dim = state["w"].shape[0] if "w" in state else 0
+            else:
+                cont_dim = state["cont.weight"].shape[1] if "cont.weight" in state else 0
+
+            # Determine cat_n_levels by collecting cat.{d}.weight rows.
+            cat_levels = []
+            d = 0
+            while f"cat.{d}.weight" in state:
+                cat_levels.append(state[f"cat.{d}.weight"].shape[0])
+                d += 1
 
         # Determine K from self.scale.
         K = int(self.scale.shape[0])

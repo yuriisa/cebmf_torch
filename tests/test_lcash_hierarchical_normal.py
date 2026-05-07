@@ -1102,6 +1102,111 @@ def test_marginal_loglik_field_continuous():
     assert abs(res.marginal_loglik + res.loss) < 1e-6
 
 
+def test_nanstandardise_zero_fill_edge_cases():
+    """`_nanstandardise` zero-fills all-NaN, single-observation, and constant columns.
+
+    After collapsing the projection step into ``_apply_nanstandardise``,
+    the ``counts > 1`` guard is gone; the equivalent zero-fill is enforced
+    by the ``sd > 0`` guard alone (single-observation columns have
+    ``var == 0`` by construction).
+    """
+    from cebmf_torch.cebnm.lcash import _nanstandardise
+
+    nan = float("nan")
+    # Col 0: all-NaN.  Col 1: single observation.  Col 2: constant.
+    # Col 3: a "normal" column to confirm non-degenerate output.
+    X = torch.tensor(
+        [
+            [nan, 7.0, 3.0, 1.0],
+            [nan, nan, 3.0, 2.0],
+            [nan, nan, 3.0, 3.0],
+            [nan, nan, 3.0, 4.0],
+        ],
+        dtype=torch.float32,
+    )
+    X_out, mu, sd = _nanstandardise(X)
+
+    # All three degenerate columns should be entirely zero-filled.
+    assert torch.all(X_out[:, 0] == 0.0)
+    assert torch.all(X_out[:, 1] == 0.0)
+    assert torch.all(X_out[:, 2] == 0.0)
+    # Their per-column sd should be exactly 0.
+    assert sd[0].item() == 0.0
+    assert sd[1].item() == 0.0
+    assert sd[2].item() == 0.0
+    # The non-degenerate column should be standardised to mean 0, var 1.
+    col3 = X_out[:, 3]
+    assert torch.isfinite(col3).all()
+    assert abs(col3.mean().item()) < 1e-6
+    # population variance, by construction
+    assert abs((col3.pow(2).mean()).item() - 1.0) < 1e-6
+    # mu/sd shapes match the input.
+    assert mu.shape == (4,)
+    assert sd.shape == (4,)
+
+
+def test_predict_pi_uses_arch_meta():
+    """`_arch_meta` is populated and `predict_pi` falls back to introspection without it.
+
+    Trains a small mixed-head model, asserts the cached metadata matches
+    the actual architecture, then patches ``_arch_meta = None`` on a deep
+    copy of the result and verifies that ``predict_pi`` (state-dict
+    introspection fallback) returns numerically equal output.
+    """
+    import copy
+
+    torch.manual_seed(0)
+    g = torch.Generator().manual_seed(0)
+    n = 400
+    F = 2
+    T = 4
+
+    X = torch.randn(n, F, generator=g)
+    X_cat = torch.randint(0, T, (n, 1), generator=g, dtype=torch.long)
+    se = torch.full((n,), 0.4)
+    betahat = X[:, 0] + 0.5 * X_cat[:, 0].float() + se * torch.randn(n, generator=g)
+
+    res = lcash_posterior_means(
+        X=X,
+        betahat=betahat,
+        sebetahat=se,
+        n_epochs=20,
+        batch_size=512,
+        lr=1e-2,
+        penalty=1.0,
+        ash_init=True,
+        verbose=False,
+        device=torch.device("cpu"),
+        seed=42,
+        X_cat=X_cat,
+        n_cat_levels=T,
+    )
+
+    # Architecture metadata is populated and matches the actual heads.
+    assert hasattr(res, "_arch_meta")
+    meta = res._arch_meta
+    assert meta is not None
+    assert set(meta.keys()) == {"is_po", "cont_dim", "cat_n_levels"}
+    assert meta["is_po"] is False  # softmax LC-ASH, not PO
+    assert meta["cont_dim"] == F
+    assert meta["cat_n_levels"] == [T]
+
+    # predict_pi using cached metadata.
+    g2 = torch.Generator().manual_seed(2)
+    X_new = torch.randn(8, F, generator=g2)
+    X_cat_new = torch.randint(0, T, (8, 1), generator=g2, dtype=torch.long)
+    pi_with_meta = res.predict_pi(X=X_new, X_cat=X_cat_new)
+
+    # Strip _arch_meta on a deep copy and confirm the fallback introspection
+    # path produces equal output (numerical identity, not just close).
+    res_legacy = copy.deepcopy(res)
+    res_legacy._arch_meta = None
+    pi_fallback = res_legacy.predict_pi(X=X_new, X_cat=X_cat_new)
+
+    assert pi_with_meta.shape == pi_fallback.shape
+    assert torch.allclose(pi_with_meta, pi_fallback, atol=0.0, rtol=0.0)
+
+
 def test_predict_pi_propodds_smoke():
     """predict_pi works for a PO-LC-ASH fit with categorical input."""
     torch.manual_seed(0)

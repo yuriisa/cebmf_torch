@@ -474,6 +474,14 @@ def _nanstandardise(X: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.
     values, and set NaN positions to 0. Columns with zero std
     (constant or all-NaN) are set to 0.
 
+    The projection step (centring/scaling/zero-fill) is delegated to
+    :func:`_apply_nanstandardise` so that training and inference share
+    a single source of truth for the arithmetic. The ``counts > 1`` guard
+    used by an earlier implementation is redundant: when ``counts <= 1``
+    the per-column ``var`` is exactly 0 (the single observed deviation is
+    ``X - X = 0``), so ``sd == 0`` and ``_apply_nanstandardise``'s
+    ``sd > 0`` guard zero-fills those columns automatically.
+
     Returns
     -------
     X_out, mu, sd
@@ -500,13 +508,8 @@ def _nanstandardise(X: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.
     var = (diff**2).sum(dim=0) / safe_counts  # (F,)
     sd = var.sqrt()
 
-    # Standardise observed, zero-fill missing
-    safe_sd = torch.where((sd > 0) & (counts > 1), sd, torch.ones_like(sd))
-    X_out = torch.where(
-        mask & (sd > 0).unsqueeze(0) & (counts > 1).unsqueeze(0),
-        diff / safe_sd,
-        torch.zeros_like(X),
-    )
+    # Delegate projection to the shared helper (single source of truth).
+    X_out = _apply_nanstandardise(X, mu, sd)
     return X_out, mu, sd
 
 
@@ -1175,6 +1178,15 @@ def _fit_lcash(
     # by `cebmf.py`'s per-factor `kl_l[k] = (-loss) - nm_ll_L` formula.
     # ``marginal_loglik`` is exposed as an explicit field so users do not
     # have to invert the sign on ``loss`` to track convergence.
+    # Architecture metadata cached at training time so ``predict_pi`` can
+    # rebuild the net without re-deriving shapes from the ``state_dict``.
+    # Private (leading underscore); not part of the public API.
+    arch_meta = {
+        "is_po": model_class is PropOddsLcashNet,
+        "cont_dim": cont_dim,
+        "cat_n_levels": list(cat_levels) if cat_levels else [],
+    }
+
     return cash_PosteriorMeanNorm(
         post_mean=post_mean,
         post_mean2=post_mean2,
@@ -1188,6 +1200,7 @@ def _fit_lcash(
         marginal_loglik=marginal_loglik,
         x_means=x_means,
         x_stds=x_stds,
+        _arch_meta=arch_meta,
     )
 
 
