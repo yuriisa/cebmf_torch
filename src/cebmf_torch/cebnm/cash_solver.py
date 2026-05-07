@@ -94,6 +94,7 @@ class cash_PosteriorMeanNorm:
         loss=0,
         model_param=None,
         priors_fitted=None,
+        priors_fitted_history=None,
     ):
         """
         Container for the results of the CASH posterior mean estimation.
@@ -120,6 +121,14 @@ class cash_PosteriorMeanNorm:
             ``{0: {"tau2": 0.42, "solver": "normal"}}``). ``None`` when no
             Level-2 prior was active. Step 4 will move to string keys via
             the typed feature API.
+        priors_fitted_history : list of dict or None, optional
+            Per-E-step history of fitted Level-2 hyperparameters, one dict per
+            E-step. Each dict has the same shape as ``priors_fitted``
+            (column-index keys, ``{"tau2": ..., "solver": ...}`` values).
+            ``None`` when no Level-2 prior was active. Useful for diagnosing
+            whether ``tau2`` has stabilised by the end of training; users
+            interpreting ``tau2`` for inferential purposes should verify it
+            has flattened across the last several E-steps.
         """
         self.post_mean = post_mean
         self.post_mean2 = post_mean2
@@ -129,6 +138,7 @@ class cash_PosteriorMeanNorm:
         self.scale = scale
         self.model_param = model_param
         self.priors_fitted = priors_fitted
+        self.priors_fitted_history = priors_fitted_history
 
 
 # Class to store the results

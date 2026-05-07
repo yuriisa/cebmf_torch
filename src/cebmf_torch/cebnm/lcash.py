@@ -574,11 +574,18 @@ def _train_model(
     label: str,
     seed: int = 42,
     cat_prior: list[str | None] | None = None,
-    prior_warmup_epochs: int = 20,
+    prior_warmup_epochs: int = 5,
     prior_refit_every: int = 10,
     tau2_min: float = 1e-6,
-) -> tuple[float, dict]:
-    """Run the training loop. Returns ``(final_epoch_loss, priors_state)``.
+    prior_tol: float | None = 0.01,
+) -> tuple[float, dict, list[dict]]:
+    """Run the training loop.
+
+    Returns ``(final_epoch_loss, priors_state, priors_state_history)``.
+    ``priors_state_history`` is a list of per-E-step snapshots (one
+    ``dict`` per E-step that fired); each snapshot has the same shape as
+    ``priors_state``. The list is empty when ``cat_prior is None`` or
+    no E-step ever fires.
 
     Pre-computes the (G, K) log-likelihood matrix once rather than
     recomputing per mini-batch (logL is constant during training).
@@ -599,6 +606,14 @@ def _train_model(
     During warm-up (``epochs_done < prior_warmup_epochs``) the prior
     contribution is zero. ``priors_state`` is empty until the first
     E-step, which fires after the first warm-up-completing M-step.
+
+    When ``prior_tol`` is not ``None``, after each E-step the maximum
+    (across active categorical columns) of ``|log(tau2_new) -
+    log(tau2_old)|`` is computed. If this max is below ``prior_tol`` for
+    two consecutive E-steps, training exits early (the alternating loop
+    breaks before consuming the remaining ``n_epochs`` budget). The
+    first E-step has no predecessor and therefore cannot trigger
+    early-stopping by itself.
     """
     model.train()
     if X_scaled is not None:
@@ -630,6 +645,10 @@ def _train_model(
 
     n_batches = max(1, len(loader))
     priors_state: dict[int, dict] = {}
+    priors_state_history: list[dict] = []
+    # Counter of consecutive E-steps whose max log(tau2)-change fell
+    # below prior_tol. Triggers early-stopping when it reaches 2.
+    consecutive_below_tol = 0
 
     # Outer alternating loop. When cat_prior is None, n_outer == 1 and
     # epochs_this_iter == n_epochs, so we recover the original loop.
@@ -639,6 +658,7 @@ def _train_model(
         n_outer = math.ceil(n_epochs / prior_refit_every) if n_epochs > 0 else 0
 
     final_epoch_loss = 0.0
+    early_stop = False
     for outer_iter in range(n_outer):
         if cat_prior is None:
             epochs_done = 0
@@ -691,6 +711,9 @@ def _train_model(
             continue
         epochs_completed = epochs_done + epochs_this_iter
         if epochs_completed >= prior_warmup_epochs:
+            # Snapshot the prior state BEFORE the E-step overwrites it,
+            # so we can compute the relative change in log(tau2).
+            prev_priors_state = {d: dict(psi) for d, psi in priors_state.items()}
             for d, prior_name in enumerate(cat_prior):
                 if prior_name is None:
                     continue
@@ -704,7 +727,42 @@ def _train_model(
                     raise ValueError(f"Unsupported Level-2 solver: {prior_name!r}")
                 priors_state[d] = psi
 
-    return final_epoch_loss, priors_state
+            # Record a snapshot of the just-fitted state. Snapshot dicts
+            # are decoupled from priors_state so subsequent E-steps don't
+            # mutate the recorded entries.
+            snapshot = {
+                d: {"tau2": priors_state[d]["tau2"], "solver": cat_prior[d]}
+                for d in priors_state
+                if cat_prior[d] is not None
+            }
+            priors_state_history.append(snapshot)
+
+            # Early-stopping check: requires a previous E-step to compare
+            # against. The first E-step (prev empty) cannot trigger.
+            if prior_tol is not None and prev_priors_state:
+                max_log_change = 0.0
+                for d, prior_name in enumerate(cat_prior):
+                    if prior_name is None or d not in prev_priors_state or d not in priors_state:
+                        continue
+                    tau2_old = prev_priors_state[d]["tau2"]
+                    tau2_new = priors_state[d]["tau2"]
+                    if tau2_old > 0 and tau2_new > 0:
+                        change = abs(math.log(tau2_new) - math.log(tau2_old))
+                        if change > max_log_change:
+                            max_log_change = change
+                if max_log_change < prior_tol:
+                    consecutive_below_tol += 1
+                else:
+                    consecutive_below_tol = 0
+                if consecutive_below_tol >= 2:
+                    if verbose:
+                        print(f"[{label}] Level-2 prior stabilised at epoch {epochs_completed}; early stopping.")
+                    early_stop = True
+
+        if early_stop:
+            break
+
+    return final_epoch_loss, priors_state, priors_state_history
 
 
 def _compute_posteriors(
@@ -826,6 +884,25 @@ def _build_optimizer(
     return torch.optim.Adam(param_groups, lr=lr)
 
 
+def _resolve_weight_decay(weight_decay: float | None, cat_prior_list: list[str | None] | None) -> float:
+    """Single source of truth for the conditional ``weight_decay`` default.
+
+    When the user passes ``weight_decay=None`` (sentinel), we resolve it
+    based on whether a Level-2 prior is active:
+
+    - ``0.0`` if any ``cat_prior`` entry is non-None: the EB prior takes
+      over the regularisation role and Adam L2 has been observed
+      empirically to silently suppress it.
+    - ``1e-3`` otherwise: preserves the historical default for the
+      non-hierarchical fit.
+
+    A non-None ``weight_decay`` is returned verbatim.
+    """
+    if weight_decay is None:
+        return 0.0 if cat_prior_list is not None else 1e-3
+    return weight_decay
+
+
 def _fit_lcash(
     X: torch.Tensor | None,
     betahat: torch.Tensor,
@@ -847,9 +924,10 @@ def _fit_lcash(
     X_cat: torch.Tensor | None = None,
     n_cat_levels: int | list[int] | None = None,
     cat_prior: str | list[str | None] | None = None,
-    prior_warmup_epochs: int = 20,
+    prior_warmup_epochs: int = 5,
     prior_refit_every: int = 10,
     tau2_min: float = 1e-6,
+    prior_tol: float | None = 0.01,
 ) -> cash_PosteriorMeanNorm:
     """Shared implementation for both softmax and proportional odds LC-ASH.
 
@@ -874,8 +952,7 @@ def _fit_lcash(
     n_cat_cols = X_cat.shape[1] if X_cat is not None else 0
     cat_prior_list = _normalise_cat_prior(cat_prior, n_cat_cols)
 
-    if weight_decay is None:
-        weight_decay = 1e-3
+    weight_decay = _resolve_weight_decay(weight_decay, cat_prior_list)
 
     # Local RNG for reproducible weight init and batch ordering.
     # Does not mutate global torch RNG state.
@@ -897,7 +974,7 @@ def _fit_lcash(
 
     optimizer = _build_optimizer(model, model_class, weight_decay=weight_decay, lr=lr)
 
-    _, priors_state = _train_model(
+    _, priors_state, priors_state_history = _train_model(
         model,
         optimizer,
         X_scaled,
@@ -915,6 +992,7 @@ def _fit_lcash(
         prior_warmup_epochs=prior_warmup_epochs,
         prior_refit_every=prior_refit_every,
         tau2_min=tau2_min,
+        prior_tol=prior_tol,
     )
 
     post_mean, post_mean2, post_sd, all_pi_values, marginal_loglik = _compute_posteriors(
@@ -933,6 +1011,7 @@ def _fit_lcash(
     # this keeps the contract "dict-with-entries | None" rather than
     # "possibly empty dict | None".
     priors_fitted: dict | None
+    priors_fitted_history: list[dict] | None
     if cat_prior_list is not None and len(priors_state) > 0:
         priors_fitted = {
             d: {"tau2": priors_state[d]["tau2"], "solver": cat_prior_list[d]}
@@ -943,6 +1022,11 @@ def _fit_lcash(
             priors_fitted = None
     else:
         priors_fitted = None
+
+    if cat_prior_list is not None and len(priors_state_history) > 0:
+        priors_fitted_history = priors_state_history
+    else:
+        priors_fitted_history = None
 
     # `loss` is the negative full-data marginal log-likelihood under the
     # fitted prior, *without* the spike Dirichlet penalty. This matches
@@ -957,6 +1041,7 @@ def _fit_lcash(
         scale=scale,
         model_param=model.state_dict(),
         priors_fitted=priors_fitted,
+        priors_fitted_history=priors_fitted_history,
     )
 
 
@@ -985,9 +1070,10 @@ def lcash_posterior_means(
     X_cat: torch.Tensor | None = None,
     n_cat_levels: int | list[int] | None = None,
     cat_prior: str | list[str | None] | None = None,
-    prior_warmup_epochs: int = 20,
+    prior_warmup_epochs: int = 5,
     prior_refit_every: int = 10,
     tau2_min: float = 1e-6,
+    prior_tol: float | None = 0.01,
 ) -> cash_PosteriorMeanNorm:
     """LC-ASH: linear covariate-modulated mixture weights.
 
@@ -1010,11 +1096,17 @@ def lcash_posterior_means(
         Learning rate.
     weight_decay : float or None
         L2 weight decay applied via Adam to coefficient-like parameters
-        (continuous-feature weights and categorical embeddings). Bias and
-        cut-points are excluded. ``None`` (default) resolves to ``1e-3``.
-        Pass ``0.0`` explicitly to disable Adam-side regularisation entirely
-        (e.g., when relying solely on a Level-2 hierarchical prior via
-        ``cat_prior``).
+        (continuous-feature weights and categorical embeddings); bias and
+        cut-points are excluded. ``None`` (default) resolves at runtime:
+
+        - ``0.0`` if any ``cat_prior`` entry is non-None (the Level-2
+          hierarchical prior takes over the regularisation role; mixing
+          with Adam L2 has been observed empirically to silently
+          suppress the EB prior).
+        - ``1e-3`` otherwise (preserves the historical default for
+          non-hierarchical fits).
+
+        Pass an explicit numeric value to override.
     penalty : float
         Dirichlet spike penalty (lambda_pen).  1.0 = no penalty.
     mult : float
@@ -1056,13 +1148,24 @@ def lcash_posterior_means(
         will be added in Step 5.
     prior_warmup_epochs : int, keyword-only
         Number of epochs at the start of training during which the
-        Level-2 prior contribution is omitted.  Default 20.
+        Level-2 prior contribution is omitted.  Default 5 epochs. The
+        warmup window must be short enough that embeddings have not yet
+        diffused under the noise floor / weight_decay; otherwise the
+        first E-step learns a wide prior from noise rather than data
+        signal.
     prior_refit_every : int, keyword-only
         Number of M-step epochs between successive E-steps.  Default 10.
     tau2_min : float, keyword-only
         Lower bound on the fitted ``tau2`` for the Normal Level-2 prior.
         Plumbed through to :func:`fit_normal` and :func:`ebnm_normal`.
         Default ``1e-6`` prevents the degenerate sink at ``tau2 = 0``.
+    prior_tol : float or None, keyword-only
+        Relative-change tolerance on log(tau2) for early-stopping the
+        alternating M/E loop. If the absolute change ``|log tau2_new -
+        log tau2_old|`` falls below ``prior_tol`` for two consecutive
+        E-steps (across all active categorical columns), training exits
+        early without consuming the remaining ``n_epochs`` budget. Set
+        to ``None`` to disable early stopping. Default 0.01.
 
     Returns
     -------
@@ -1070,7 +1173,10 @@ def lcash_posterior_means(
         Container with post_mean, post_mean2, post_sd, pi_np (G, K),
         scale (K,), loss, model_param (state dict for warm-starting),
         priors_fitted (dict of fitted Level-2 hyperparameters keyed by
-        categorical column index, or ``None`` when ``cat_prior`` is unset).
+        categorical column index, or ``None`` when ``cat_prior`` is unset),
+        and priors_fitted_history (per-E-step list of snapshots, or
+        ``None`` when no E-step ever fires; useful for diagnosing whether
+        ``tau2`` has stabilised by end of training).
     """
     return _fit_lcash(
         X,
@@ -1096,6 +1202,7 @@ def lcash_posterior_means(
         prior_warmup_epochs=prior_warmup_epochs,
         prior_refit_every=prior_refit_every,
         tau2_min=tau2_min,
+        prior_tol=prior_tol,
     )
 
 
@@ -1119,9 +1226,10 @@ def po_lcash_posterior_means(
     X_cat: torch.Tensor | None = None,
     n_cat_levels: int | list[int] | None = None,
     cat_prior: str | list[str | None] | None = None,
-    prior_warmup_epochs: int = 20,
+    prior_warmup_epochs: int = 5,
     prior_refit_every: int = 10,
     tau2_min: float = 1e-6,
+    prior_tol: float | None = 0.01,
 ) -> cash_PosteriorMeanNorm:
     """Proportional odds LC-ASH: ordered logistic covariate-modulated weights.
 
@@ -1145,7 +1253,7 @@ def po_lcash_posterior_means(
     betahat, sebetahat, n_epochs, batch_size, lr, weight_decay, penalty,
     mult, ash_init, ash_threshold, model_param, device, verbose, seed :
         See :func:`lcash_posterior_means`.
-    X_cat, n_cat_levels, cat_prior, prior_warmup_epochs, prior_refit_every, tau2_min :
+    X_cat, n_cat_levels, cat_prior, prior_warmup_epochs, prior_refit_every, tau2_min, prior_tol :
         See :func:`lcash_posterior_means`.
 
     Returns
@@ -1153,7 +1261,8 @@ def po_lcash_posterior_means(
     cash_PosteriorMeanNorm
         Container with post_mean, post_mean2, post_sd, pi_np (G, K),
         scale (K,), loss, model_param (state dict for warm-starting),
-        priors_fitted (dict of fitted Level-2 hyperparameters or ``None``).
+        priors_fitted (dict of fitted Level-2 hyperparameters or ``None``),
+        and priors_fitted_history (per-E-step list of snapshots, or ``None``).
     """
     return _fit_lcash(
         X,
@@ -1179,4 +1288,5 @@ def po_lcash_posterior_means(
         prior_warmup_epochs=prior_warmup_epochs,
         prior_refit_every=prior_refit_every,
         tau2_min=tau2_min,
+        prior_tol=prior_tol,
     )

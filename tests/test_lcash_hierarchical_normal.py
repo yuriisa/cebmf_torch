@@ -11,13 +11,25 @@ Covers Section 11.3 of ``cebmf_torch_hierarchical_priors_design.md``:
 - tau2 collapse regimes respect the ``tau2_min`` clamp.
 - Batch-size invariance (validates the |B|/N scaling rule).
 - Row 0 (gauge) excluded from the Level-2 fit.
+
+Batch-A field-test follow-ups:
+
+- Conditional ``weight_decay`` default (0.0 with cat_prior, 1e-3 without).
+- Default ``prior_warmup_epochs`` is 5 (lowered from 20).
+- ``priors_fitted_history`` records per-E-step tau2 trajectory.
+- ``prior_tol`` early-stops the alternating loop on log(tau2) stability.
 """
 
+import inspect
 import math
 
 import torch
 
-from cebmf_torch.cebnm.lcash import lcash_posterior_means, po_lcash_posterior_means
+from cebmf_torch.cebnm.lcash import (
+    _resolve_weight_decay,
+    lcash_posterior_means,
+    po_lcash_posterior_means,
+)
 
 
 def _simulate_per_trait(
@@ -490,3 +502,206 @@ def test_propodds_normal_prior_smoke():
     assert "cat.0.weight" in state
     if K > 2:
         assert "delta_gaps" in state
+
+
+# ---------------------------------------------------------------------------
+# Batch-A field-test follow-ups
+# ---------------------------------------------------------------------------
+
+
+def test_normal_prior_default_weight_decay_when_cat_prior_set():
+    """When ``cat_prior`` is non-trivial and ``weight_decay=None``, the
+    resolved decay is 0.0; with ``cat_prior=None`` it is 1e-3.
+
+    The field tester observed empirically that 1e-3 Adam L2 dominates the
+    EB prior (silent no-op at predictive level); the resolver therefore
+    flips to 0.0 whenever a Level-2 prior is active.
+    """
+    # With a non-trivial cat_prior, default resolves to 0.0.
+    assert _resolve_weight_decay(None, ["normal"]) == 0.0
+    # Without cat_prior (or all-None list normalised to None), default is 1e-3.
+    assert _resolve_weight_decay(None, None) == 1e-3
+    # Mixed list with at least one non-None solver also resolves to 0.0.
+    assert _resolve_weight_decay(None, ["normal", None]) == 0.0
+    # Explicit user value pass-through, regardless of cat_prior.
+    assert _resolve_weight_decay(5e-4, ["normal"]) == 5e-4
+    assert _resolve_weight_decay(0.0, None) == 0.0
+
+
+def test_normal_prior_default_warmup_short():
+    """The default ``prior_warmup_epochs`` is 5 (lowered from 20).
+
+    Long warmup with the new ``weight_decay=0`` default lets embeddings
+    diffuse under the random-init noise floor, which then biases the first
+    E-step's tau2 estimate. Short warmup is the safer default.
+    """
+    sig_l = inspect.signature(lcash_posterior_means)
+    sig_p = inspect.signature(po_lcash_posterior_means)
+    assert sig_l.parameters["prior_warmup_epochs"].default == 5
+    assert sig_p.parameters["prior_warmup_epochs"].default == 5
+
+
+def test_priors_fitted_history_populated():
+    """The per-E-step history is recorded with the right schema."""
+    torch.manual_seed(0)
+    X_cat, betahat, se, _ = _simulate_per_trait(
+        n_per_trait=60, n_signal=4, n_null=16, signal_sd=2.0, obs_sd=0.5, seed=0
+    )
+
+    n_epochs = 80
+    refit = 10
+    warmup = 5
+
+    res = lcash_posterior_means(
+        X=None,
+        betahat=betahat,
+        sebetahat=se,
+        n_epochs=n_epochs,
+        batch_size=512,
+        lr=1e-2,
+        penalty=1.0,
+        ash_init=True,
+        verbose=False,
+        device=torch.device("cpu"),
+        seed=42,
+        X_cat=X_cat,
+        n_cat_levels=20,
+        cat_prior=["normal"],
+        prior_warmup_epochs=warmup,
+        prior_refit_every=refit,
+        prior_tol=None,  # disable early-stopping for this test
+    )
+
+    assert res.priors_fitted_history is not None
+    # Number of E-steps that fired equals number of outer iterations,
+    # each one running prior_refit_every epochs (so n_epochs / refit).
+    assert len(res.priors_fitted_history) == n_epochs // refit
+    for snapshot in res.priors_fitted_history:
+        assert 0 in snapshot
+        psi = snapshot[0]
+        assert "tau2" in psi
+        assert psi["solver"] == "normal"
+        assert psi["tau2"] >= 1e-6
+    # The final history entry agrees with priors_fitted (same fit).
+    assert math.isclose(
+        res.priors_fitted_history[-1][0]["tau2"],
+        res.priors_fitted[0]["tau2"],
+        rel_tol=1e-9,
+    )
+
+
+def test_priors_fitted_history_trace_makes_sense():
+    """The recorded ``tau2`` trace is consistent with stabilisation.
+
+    With ``prior_tol=None`` and a long horizon, tau2 either monotonically
+    converges or settles into a tight band. We assert that the final
+    value is close to the median of the second half of the trace.
+    """
+    torch.manual_seed(0)
+    X_cat, betahat, se, _ = _simulate_per_trait(
+        n_per_trait=60, n_signal=4, n_null=16, signal_sd=2.0, obs_sd=0.5, seed=0
+    )
+
+    res = lcash_posterior_means(
+        X=None,
+        betahat=betahat,
+        sebetahat=se,
+        n_epochs=120,
+        batch_size=512,
+        lr=1e-2,
+        penalty=1.0,
+        ash_init=True,
+        verbose=False,
+        device=torch.device("cpu"),
+        seed=42,
+        X_cat=X_cat,
+        n_cat_levels=20,
+        cat_prior=["normal"],
+        prior_warmup_epochs=5,
+        prior_refit_every=10,
+        prior_tol=None,
+    )
+
+    assert res.priors_fitted_history is not None
+    tau2_trace = [snap[0]["tau2"] for snap in res.priors_fitted_history]
+    assert len(tau2_trace) >= 4
+
+    second_half = sorted(tau2_trace[len(tau2_trace) // 2 :])
+    median_second_half = second_half[len(second_half) // 2]
+    final = tau2_trace[-1]
+    # The final value is within a factor of 2 of the second-half median;
+    # this captures the qualitative claim "trace stabilises" without being
+    # brittle to the exact noise of a stochastic optimiser.
+    assert 0.5 * median_second_half <= final <= 2.0 * median_second_half, (
+        f"tau2 trace did not stabilise: final={final}, median(second half)={median_second_half}, trace={tau2_trace}"
+    )
+
+
+def test_prior_tol_early_stops():
+    """``prior_tol`` triggers early-stopping before ``n_epochs`` is consumed."""
+    torch.manual_seed(0)
+    X_cat, betahat, se, _ = _simulate_per_trait(
+        n_per_trait=60, n_signal=4, n_null=16, signal_sd=2.0, obs_sd=0.5, seed=0
+    )
+
+    n_epochs = 2000
+    refit = 10
+    res = lcash_posterior_means(
+        X=None,
+        betahat=betahat,
+        sebetahat=se,
+        n_epochs=n_epochs,
+        batch_size=512,
+        lr=1e-2,
+        penalty=1.0,
+        ash_init=True,
+        verbose=False,
+        device=torch.device("cpu"),
+        seed=42,
+        X_cat=X_cat,
+        n_cat_levels=20,
+        cat_prior=["normal"],
+        prior_warmup_epochs=5,
+        prior_refit_every=refit,
+        prior_tol=0.01,
+    )
+
+    assert res.priors_fitted_history is not None
+    n_e_steps = len(res.priors_fitted_history)
+    # If we ran the full budget, we'd see n_epochs / refit = 200 E-steps.
+    # Early-stopping should cut this off well before then.
+    assert n_e_steps < n_epochs // refit, (
+        f"prior_tol failed to early-stop: ran {n_e_steps} E-steps out of a budget of {n_epochs // refit}"
+    )
+
+
+def test_prior_tol_disabled():
+    """With ``prior_tol=None`` the loop runs the full ``n_epochs`` budget."""
+    torch.manual_seed(0)
+    X_cat, betahat, se, _ = _simulate_per_trait(
+        n_per_trait=60, n_signal=4, n_null=16, signal_sd=2.0, obs_sd=0.5, seed=0
+    )
+
+    n_epochs = 80
+    refit = 10
+    res = lcash_posterior_means(
+        X=None,
+        betahat=betahat,
+        sebetahat=se,
+        n_epochs=n_epochs,
+        batch_size=512,
+        lr=1e-2,
+        penalty=1.0,
+        ash_init=True,
+        verbose=False,
+        device=torch.device("cpu"),
+        seed=42,
+        X_cat=X_cat,
+        n_cat_levels=20,
+        cat_prior=["normal"],
+        prior_warmup_epochs=5,
+        prior_refit_every=refit,
+        prior_tol=None,
+    )
+    assert res.priors_fitted_history is not None
+    assert len(res.priors_fitted_history) == n_epochs // refit
