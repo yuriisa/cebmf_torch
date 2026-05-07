@@ -28,6 +28,58 @@ Public API:
 * :func:`s_lc_ash_log_marginal` — per-observation marginal log-density kernel.
 * :func:`s_lc_ash_compute_posteriors` — per-observation posterior moments kernel.
 * :func:`warm_start_from_pooled_ash` — slab + pooled-spike warm-start helper.
+
+Notes on the level-2 hyperparameter ``tau_c^2``
+-----------------------------------------------
+
+The level-2 prior on ``log c_t`` is a free-mean Normal
+``N(mu_c, tau_c^2)`` with ``mu_c`` and ``log tau_c`` learnable
+parameters optimised jointly with everything else under a single
+Adam loop. The Normal log-density's ``-T*log(tau_c)`` normaliser
+provides a restoring gradient against ``tau_c -> 0`` that closed-form
+alternating empirical Bayes lacks. **However, this restoring force
+acts only when at least some per-trait ``log c_t`` values diverge from
+``mu_c``.** On panels where the data prefers a homogeneous solution
+(every ``c_t`` close to the panel mean), the level-2 quadratic term
+collapses to zero, the ``-T*log(tau_c)`` term dominates, and
+``tau_c^2`` shrinks to the ``tau2_min`` floor.
+
+This was observed by the CAESER 246-trait validation in both
+training directions: the per-trait ``c_t`` values clustered tightly
+around the panel mean (range ``[0.949, 0.966]`` on UKB-trained,
+``[0.984, 0.986]`` on AGD-trained), and ``tau_c^2`` collapsed to
+``~10^-6`` over a few hundred epochs. The marginal log-likelihood
+decreased by tens of nats panel-total over a 1500-epoch fit,
+matching the diagnostic signature of misspecified-prior collapse,
+**but the predictive impact is negligible** (paired test LPD changes
+by ``~10^-5``). The model degrades gracefully to "pooled ASH plus
+shared spike" in this regime, which itself beats per-trait ASH on
+that panel.
+
+The deployment workflow side-steps the issue by panel construction:
+restricting the panel to well-pinned high-power traits (and adding
+underpowered traits via :func:`fit_new_trait`) keeps the per-trait
+``c_t`` values diverse enough that ``tau_c^2`` stays well above the
+floor. CAESER measured ``tau_c^2 = 0.115`` on the well-pinned 50-trait
+subset versus ``4 x 10^-4`` on the full 246-trait fit.
+
+A consequence of the **free-mean** parameterisation: any panel-wide
+multiplicative shift in slab width is absorbed into ``mu_c`` rather
+than into the per-trait ``c_t`` values, so the per-trait ``c_t``
+spread is narrower than what an **anchored** parameterisation (e.g.
+geometric-mean-1 constraint on ``log c_t``) would give. This is a
+parameterisation choice, not a fitting failure: the predictive
+content is identical, and the CAESER R-side analogue
+``beta_pool_scale`` (which uses an anchor) reproduces the predictive
+numbers of S-LC-ASH to within FP noise on the 246-trait panel. If
+interpretability of ``c_t`` as an absolute multiplier matters
+downstream, an anchored variant is a natural follow-up.
+
+Users diagnosing a single ``tau_c^2`` quote should therefore not
+treat a small value as evidence of optimisation failure; check the
+per-trait ``c_t`` spread first. If ``c_t`` values are narrow and
+predictives are good, the optimum is genuinely homogeneous and the
+collapse is the right answer.
 """
 
 from __future__ import annotations

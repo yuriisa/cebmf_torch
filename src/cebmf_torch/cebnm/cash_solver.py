@@ -260,8 +260,16 @@ class cash_PosteriorMeanNorm:
         if arch_meta is not None and arch_meta.get("family") == "s_lc_ash":
             raise NotImplementedError(
                 "predict_pi is not implemented for the S-LC-ASH family. "
-                "Use cebmf_torch.cebnm.fit_new_trait(betahat, sebetahat, panel_result) "
-                "to obtain posteriors for a new trait given the panel-trained model."
+                "Two supported paths to score new data: "
+                "(1) for genes from a NEW trait, call "
+                "cebmf_torch.cebnm.fit_new_trait(betahat, sebetahat, panel_result) "
+                "to fit a per-trait c_t and obtain posteriors via "
+                "s_lc_ash_compute_posteriors; "
+                "(2) for genes from a trait that WAS in the panel (or any "
+                "scoring with known c_t and shared p), call "
+                "cebmf_torch.cebnm.s_lc_ash.s_lc_ash_compute_posteriors(...) "
+                "directly with the per-trait log_c, the shared logit_p, the "
+                "shared eta and sigma read off panel_result.model_param."
             )
         if arch_meta is not None:
             is_po = arch_meta["is_po"]
