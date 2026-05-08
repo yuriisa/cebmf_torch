@@ -158,11 +158,11 @@ class cash_PosteriorMeanNorm:
             list[int]}``) needed by :meth:`predict_pi` to rebuild the
             net without re-deriving the architecture from the
             ``state_dict``. The S-LC-ASH training entry points populate
-            it with ``{"family": "s_lc_ash", "n_levels": int, "K": int}`` (or
-            ``{"family": "s_lc_ash", "single_level": True, "K": int}``
+            it with ``{"family": "s_lcash", "n_levels": int, "K": int}`` (or
+            ``{"family": "s_lcash", "single_level": True, "K": int}``
             for cold-start results) and :meth:`predict_pi` raises
             :class:`NotImplementedError` for that family with a pointer
-            to :func:`s_lc_ash_new_level_posterior_means`. ``None`` is supported for backwards
+            to :func:`s_lcash_new_level_posterior_means`. ``None`` is supported for backwards
             compatibility with older pickled results; in that case
             :meth:`predict_pi` falls back to ``state_dict`` introspection.
         level_params : dict or None, optional
@@ -257,18 +257,18 @@ class cash_PosteriorMeanNorm:
         # to ``state_dict`` introspection so older pickled results (which
         # predate ``_arch_meta``) keep working unchanged.
         arch_meta = getattr(self, "_arch_meta", None)
-        if arch_meta is not None and arch_meta.get("family") == "s_lc_ash":
+        if arch_meta is not None and arch_meta.get("family") == "s_lcash":
             raise NotImplementedError(
                 "predict_pi is not implemented for the S-LC-ASH family. "
                 "Two supported paths to score new data: "
                 "(1) for genes from a NEW level (a level of the categorical "
                 "covariate that was not present in the panel), call "
-                "cebmf_torch.cebnm.s_lc_ash_new_level_posterior_means(betahat, sebetahat, panel_result) "
+                "cebmf_torch.cebnm.s_lcash_new_level_posterior_means(betahat, sebetahat, panel_result) "
                 "to fit a per-level c_t and obtain posteriors via "
-                "s_lc_ash_compute_posteriors; "
+                "s_lcash_compute_posteriors; "
                 "(2) for genes from a level that WAS in the panel (or any "
                 "scoring with known c_t and shared p), call "
-                "cebmf_torch.cebnm.s_lc_ash.s_lc_ash_compute_posteriors(...) "
+                "cebmf_torch.cebnm.s_lcash.s_lcash_compute_posteriors(...) "
                 "directly with the per-level log_c, the shared logit_p, the "
                 "shared eta and sigma read off panel_result.model_param."
             )

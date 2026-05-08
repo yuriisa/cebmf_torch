@@ -13,12 +13,12 @@ import pytest
 import torch
 from scipy import stats as sps
 
-from cebmf_torch.cebnm import s_lc_ash_new_level_posterior_means, s_lc_ash_posterior_means
+from cebmf_torch.cebnm import s_lcash_new_level_posterior_means, s_lcash_posterior_means
 from cebmf_torch.cebnm.cash_solver import cash_PosteriorMeanNorm
-from cebmf_torch.cebnm.s_lc_ash import (
-    SLCAshNet,
-    s_lc_ash_compute_posteriors,
-    s_lc_ash_log_marginal,
+from cebmf_torch.cebnm.s_lcash import (
+    SLcashNet,
+    s_lcash_compute_posteriors,
+    s_lcash_log_marginal,
     _warm_start_from_pooled_ash,
 )
 
@@ -116,7 +116,7 @@ class TestMarginalDensity:
         eta = torch.log(torch.tensor(w, dtype=torch.float64))
         sigma_t = torch.tensor(sigma, dtype=torch.float64)
 
-        log_m = s_lc_ash_log_marginal(beta, se, level_id, log_c, logit_p, eta, sigma_t)
+        log_m = s_lcash_log_marginal(beta, se, level_id, log_c, logit_p, eta, sigma_t)
         for i, (tid, b, s) in enumerate(records):
             ref = _scipy_log_marginal(b, s, c_t_vals[tid], p, w, sigma)
             assert math.isclose(float(log_m[i]), ref, rel_tol=1e-9, abs_tol=1e-9)
@@ -130,7 +130,7 @@ class TestMarginalDensity:
         beta = torch.tensor([1e-3, 0.0, 1.0, 1e-3, 0.0, 1.0], dtype=torch.float64)
         se = torch.tensor([1e-8, 1e-8, 1e-8, 1e8, 1e8, 1e8], dtype=torch.float64)
         level_id = torch.zeros_like(beta, dtype=torch.long)
-        log_m = s_lc_ash_log_marginal(beta, se, level_id, log_c, logit_p, eta, sigma_t)
+        log_m = s_lcash_log_marginal(beta, se, level_id, log_c, logit_p, eta, sigma_t)
         assert torch.isfinite(log_m).all()
 
     def test_rejects_zero_sigma(self):
@@ -142,7 +142,7 @@ class TestMarginalDensity:
         se = torch.tensor([0.1], dtype=torch.float64)
         level_id = torch.zeros(1, dtype=torch.long)
         with pytest.raises(ValueError, match="strictly positive"):
-            s_lc_ash_log_marginal(beta, se, level_id, log_c, logit_p, eta, sigma_t)
+            s_lcash_log_marginal(beta, se, level_id, log_c, logit_p, eta, sigma_t)
 
     def test_gradient_flows(self):
         T, K = 2, 3
@@ -154,7 +154,7 @@ class TestMarginalDensity:
         beta = torch.randn(50, dtype=torch.float64) * 0.3
         se = torch.full((50,), 0.1, dtype=torch.float64)
         level_id = torch.randint(0, T, (50,))
-        log_m = s_lc_ash_log_marginal(beta, se, level_id, log_c, logit_p, eta, sigma_t)
+        log_m = s_lcash_log_marginal(beta, se, level_id, log_c, logit_p, eta, sigma_t)
         (-log_m.sum()).backward()
         assert log_c.grad is not None and torch.any(log_c.grad != 0)
         assert logit_p.grad is not None and abs(float(logit_p.grad)) > 0
@@ -184,7 +184,7 @@ class TestPosteriors:
         logit_p = torch.tensor(math.log(p / (1 - p)), dtype=torch.float64)
         eta = torch.log(torch.tensor(w, dtype=torch.float64))
         sigma_t = torch.tensor(sigma, dtype=torch.float64)
-        out = s_lc_ash_compute_posteriors(beta, se, level_id, log_c, logit_p, eta, sigma_t)
+        out = s_lcash_compute_posteriors(beta, se, level_id, log_c, logit_p, eta, sigma_t)
         for i, (tid, b, s) in enumerate(records):
             lm, pm, pm2 = _scipy_post_moments(b, s, c_t_vals[tid], p, w, sigma)
             assert math.isclose(float(out["log_marginal"][i]), lm, rel_tol=1e-10, abs_tol=1e-12)
@@ -201,7 +201,7 @@ class TestPosteriors:
         beta = torch.randn(60, dtype=torch.float64) * 0.5
         se = torch.full((60,), 0.1, dtype=torch.float64)
         level_id = torch.randint(0, T, (60,))
-        out = s_lc_ash_compute_posteriors(beta, se, level_id, log_c, logit_p, eta, sigma_t)
+        out = s_lcash_compute_posteriors(beta, se, level_id, log_c, logit_p, eta, sigma_t)
         torch.testing.assert_close(out["pi_np"].sum(dim=1), torch.ones(60, dtype=torch.float64),
                                    rtol=1e-12, atol=1e-12)
 
@@ -214,7 +214,7 @@ class TestPosteriors:
         beta = torch.tensor([0.0, 0.0, 0.0], dtype=torch.float64)
         se = torch.tensor([0.05, 0.05, 0.05], dtype=torch.float64)
         level_id = torch.zeros(3, dtype=torch.long)
-        out = s_lc_ash_compute_posteriors(beta, se, level_id, log_c, logit_p, eta, sigma_t)
+        out = s_lcash_compute_posteriors(beta, se, level_id, log_c, logit_p, eta, sigma_t)
         assert (out["pi_np"][:, 0] > 0.9).all()
         assert out["pi_np"].shape == (3, K + 1)
 
@@ -224,12 +224,12 @@ class TestPosteriors:
 # ---------------------------------------------------------------------------
 
 
-class TestSLCAshNet:
+class TestSLcashNet:
     def test_construct_and_invariants(self):
         T, K = 5, 4
         sigma = torch.tensor([0.05, 0.2, 0.8, 2.0], dtype=torch.float64)
         log_w = torch.zeros(K, dtype=torch.float64)
-        net = SLCAshNet(T, sigma, log_w, logit_p_init=1.5, log_c_init=0.0)
+        net = SLcashNet(T, sigma, log_w, logit_p_init=1.5, log_c_init=0.0)
         assert net.log_c.shape == (T,)
         assert net.logit_p.shape == ()
         assert net.eta.shape == (K,)
@@ -241,17 +241,17 @@ class TestSLCAshNet:
 
     def test_rejects_zero_sigma(self):
         with pytest.raises(ValueError, match="strictly positive"):
-            SLCAshNet(2, torch.tensor([0.0, 0.5]), torch.zeros(2), logit_p_init=0.0)
+            SLcashNet(2, torch.tensor([0.0, 0.5]), torch.zeros(2), logit_p_init=0.0)
 
     def test_state_dict_round_trip(self):
         T, K = 3, 4
         sigma = torch.tensor([0.05, 0.2, 0.8, 2.0], dtype=torch.float64)
         log_w = torch.tensor([0.1, 0.2, 0.3, 0.4], dtype=torch.float64)
-        net = SLCAshNet(T, sigma, log_w, logit_p_init=0.5, log_c_init=0.1)
+        net = SLcashNet(T, sigma, log_w, logit_p_init=0.5, log_c_init=0.1)
         state = net.state_dict()
         for k in ("sigma", "log_c", "logit_p", "eta", "mu_c", "log_tau_c"):
             assert k in state
-        net2 = SLCAshNet(T, sigma, log_w, logit_p_init=0.0, log_c_init=0.0)
+        net2 = SLcashNet(T, sigma, log_w, logit_p_init=0.0, log_c_init=0.0)
         net2.load_state_dict(state)
         torch.testing.assert_close(net.log_c, net2.log_c)
         torch.testing.assert_close(net.logit_p, net2.logit_p)
@@ -260,7 +260,7 @@ class TestSLCAshNet:
         T, K = 2, 4
         sigma = torch.tensor([0.05, 0.2, 0.8, 2.0], dtype=torch.float64)
         log_w = torch.tensor([1.5, -0.5, 2.0, -1.0], dtype=torch.float64)
-        net = SLCAshNet(T, sigma, log_w, logit_p_init=0.0)
+        net = SLcashNet(T, sigma, log_w, logit_p_init=0.0)
         w_before = net.w().clone()
         net.recentre_eta_()
         assert math.isclose(float(net.eta.mean()), 0.0, abs_tol=1e-12)
@@ -309,7 +309,7 @@ class TestWarmStart:
 class TestPanelFit:
     def test_returns_cash_posterior_mean_norm_with_expected_fields(self):
         sim = _simulate_panel(n_per_level=200, n_levels=4, seed=1)
-        res = s_lc_ash_posterior_means(
+        res = s_lcash_posterior_means(
             sim["betahat"], sim["sebetahat"], sim["X_cat"], sim["n_levels"],
             n_epochs=80, verbose=False, seed=1,
         )
@@ -317,7 +317,7 @@ class TestPanelFit:
         N = sim["betahat"].numel()
         assert res.post_mean.shape == (N,)
         assert res.pi_np.shape == (N, res.scale.numel() + 1)
-        assert res._arch_meta["family"] == "s_lc_ash"
+        assert res._arch_meta["family"] == "s_lcash"
         assert res._arch_meta["n_levels"] == sim["n_levels"]
         psi = res.priors_fitted[0]
         for k in ("mu_c", "tau2_c", "p", "solver"):
@@ -336,7 +336,7 @@ class TestPanelFit:
             n_per_level=600, n_levels=n_levels,
             c_per_level=true_c.tolist(), p_global=0.7, seed=7,
         )
-        res = s_lc_ash_posterior_means(
+        res = s_lcash_posterior_means(
             sim["betahat"], sim["sebetahat"], sim["X_cat"], n_levels,
             n_epochs=400, verbose=False, seed=7,
         )
@@ -347,8 +347,8 @@ class TestPanelFit:
     def test_seed_reproducibility(self):
         sim = _simulate_panel(n_per_level=200, n_levels=4, seed=3)
         kw = dict(n_epochs=80, verbose=False, seed=99)
-        res_a = s_lc_ash_posterior_means(sim["betahat"], sim["sebetahat"], sim["X_cat"], 4, **kw)
-        res_b = s_lc_ash_posterior_means(sim["betahat"], sim["sebetahat"], sim["X_cat"], 4, **kw)
+        res_a = s_lcash_posterior_means(sim["betahat"], sim["sebetahat"], sim["X_cat"], 4, **kw)
+        res_b = s_lcash_posterior_means(sim["betahat"], sim["sebetahat"], sim["X_cat"], 4, **kw)
         torch.testing.assert_close(res_a.post_mean, res_b.post_mean, rtol=1e-12, atol=1e-12)
         torch.testing.assert_close(res_a.level_params["c"], res_b.level_params["c"],
                                    rtol=1e-12, atol=1e-12)
@@ -358,7 +358,7 @@ class TestPanelFit:
             n_per_level=800, n_levels=10,
             c_per_level=[1.0] * 10, p_global=0.7, seed=11,
         )
-        res = s_lc_ash_posterior_means(
+        res = s_lcash_posterior_means(
             sim["betahat"], sim["sebetahat"], sim["X_cat"], 10,
             n_epochs=400, tau2_min=1e-6, verbose=False, seed=11,
         )
@@ -373,7 +373,7 @@ class TestPanelFit:
             c_per_level=[0.3, 0.5, 0.8, 1.0, 1.2, 1.5, 2.0, 2.5, 3.0, 4.0],
             p_global=0.7, seed=12,
         )
-        res = s_lc_ash_posterior_means(
+        res = s_lcash_posterior_means(
             sim["betahat"], sim["sebetahat"], sim["X_cat"], 10,
             n_epochs=400, verbose=False, seed=12,
         )
@@ -382,24 +382,24 @@ class TestPanelFit:
 
     def test_predict_pi_raises(self):
         sim = _simulate_panel(n_per_level=80, n_levels=2, seed=8)
-        res = s_lc_ash_posterior_means(
+        res = s_lcash_posterior_means(
             sim["betahat"], sim["sebetahat"], sim["X_cat"], 2, n_epochs=20, verbose=False,
         )
-        with pytest.raises(NotImplementedError, match="s_lc_ash_new_level_posterior_means"):
+        with pytest.raises(NotImplementedError, match="s_lcash_new_level_posterior_means"):
             res.predict_pi(X_cat=torch.tensor([0, 1], dtype=torch.long))
 
     def test_state_dict_kernel_round_trip(self):
         sim = _simulate_panel(n_per_level=100, n_levels=3, seed=5)
-        res = s_lc_ash_posterior_means(
+        res = s_lcash_posterior_means(
             sim["betahat"], sim["sebetahat"], sim["X_cat"], 3,
             n_epochs=40, verbose=False, seed=5,
         )
         state = res.model_param
         K = res.scale.numel()
-        net = SLCAshNet(3, res.scale, torch.zeros(K, dtype=torch.float64), logit_p_init=0.0)
+        net = SLcashNet(3, res.scale, torch.zeros(K, dtype=torch.float64), logit_p_init=0.0)
         net.load_state_dict(state)
         with torch.no_grad():
-            out = s_lc_ash_compute_posteriors(
+            out = s_lcash_compute_posteriors(
                 sim["betahat"], sim["sebetahat"], sim["X_cat"],
                 net.log_c, net.logit_p, net.eta, net.sigma,
             )
@@ -408,24 +408,24 @@ class TestPanelFit:
     def test_rejects_invalid_inputs(self):
         sim = _simulate_panel(n_per_level=20, n_levels=2, seed=8)
         with pytest.raises(ValueError, match="strictly positive"):
-            s_lc_ash_posterior_means(
+            s_lcash_posterior_means(
                 sim["betahat"], -sim["sebetahat"], sim["X_cat"], 2, n_epochs=10, verbose=False,
             )
         with pytest.raises(ValueError, match="X_cat values"):
             bad = sim["X_cat"].clone()
             bad[0] = 99
-            s_lc_ash_posterior_means(
+            s_lcash_posterior_means(
                 sim["betahat"], sim["sebetahat"], bad, 2, n_epochs=10, verbose=False,
             )
 
     def test_track_loglik_history_does_not_change_posteriors(self):
         sim = _simulate_panel(n_per_level=150, n_levels=3, seed=4)
         kw = dict(n_epochs=60, verbose=False, seed=4)
-        res_off = s_lc_ash_posterior_means(
+        res_off = s_lcash_posterior_means(
             sim["betahat"], sim["sebetahat"], sim["X_cat"], 3,
             track_loglik_history=False, **kw,
         )
-        res_on = s_lc_ash_posterior_means(
+        res_on = s_lcash_posterior_means(
             sim["betahat"], sim["sebetahat"], sim["X_cat"], 3,
             track_loglik_history=True, **kw,
         )
@@ -449,7 +449,7 @@ class TestNewLevelPosteriorMeans:
             c_per_level=[0.3, 0.5, 0.8, 1.2, 1.5, 2.0, 2.5, 3.0, 0.7, 1.8],
             p_global=0.7, seed=40,
         )
-        res = s_lc_ash_posterior_means(
+        res = s_lcash_posterior_means(
             sim["betahat"], sim["sebetahat"], sim["X_cat"], 10,
             n_epochs=400, verbose=False, seed=40, **kw,
         )
@@ -458,11 +458,11 @@ class TestNewLevelPosteriorMeans:
     def test_returns_cash_posterior_mean_norm(self):
         sim, panel = self._fit_panel()
         mask = sim["X_cat"] == 0
-        new = s_lc_ash_new_level_posterior_means(sim["betahat"][mask], sim["sebetahat"][mask], panel,
+        new = s_lcash_new_level_posterior_means(sim["betahat"][mask], sim["sebetahat"][mask], panel,
                              n_epochs=200, verbose=False, seed=40)
         assert isinstance(new, cash_PosteriorMeanNorm)
         assert new.post_mean.shape == sim["betahat"][mask].shape
-        assert new._arch_meta["family"] == "s_lc_ash"
+        assert new._arch_meta["family"] == "s_lcash"
         assert new._arch_meta["single_level"] is True
         assert new.level_params["c"].shape == (1,)
 
@@ -471,7 +471,7 @@ class TestNewLevelPosteriorMeans:
         c_before = panel.level_params["c"].clone()
         psi_before = dict(panel.priors_fitted[0])
         mask = sim["X_cat"] == 3
-        _ = s_lc_ash_new_level_posterior_means(sim["betahat"][mask], sim["sebetahat"][mask], panel,
+        _ = s_lcash_new_level_posterior_means(sim["betahat"][mask], sim["sebetahat"][mask], panel,
                             n_epochs=100, verbose=False, seed=40)
         torch.testing.assert_close(panel.level_params["c"], c_before, rtol=0, atol=0)
         for k, v in psi_before.items():
@@ -480,7 +480,7 @@ class TestNewLevelPosteriorMeans:
     def test_freezes_layer_b(self):
         sim, panel = self._fit_panel()
         mask = sim["X_cat"] == 5
-        new = s_lc_ash_new_level_posterior_means(sim["betahat"][mask], sim["sebetahat"][mask], panel,
+        new = s_lcash_new_level_posterior_means(sim["betahat"][mask], sim["sebetahat"][mask], panel,
                              n_epochs=100, verbose=False, seed=40)
         torch.testing.assert_close(new.scale, panel.scale, rtol=0, atol=0)
         torch.testing.assert_close(new.model_param["eta"], panel.model_param["eta"],
@@ -498,7 +498,7 @@ class TestNewLevelPosteriorMeans:
         c_cold = []
         for t in range(sim["n_levels"]):
             mask = sim["X_cat"] == t
-            new = s_lc_ash_new_level_posterior_means(sim["betahat"][mask], sim["sebetahat"][mask], panel,
+            new = s_lcash_new_level_posterior_means(sim["betahat"][mask], sim["sebetahat"][mask], panel,
                                  n_epochs=300, verbose=False, seed=40)
             c_cold.append(float(new.level_params["c"][0]))
         c_cold = np.array(c_cold)
@@ -513,26 +513,26 @@ class TestNewLevelPosteriorMeans:
         t_extreme = int(np.argmax(np.abs(log_c - mu_c)))
         mask = sim["X_cat"] == t_extreme
         b, s = sim["betahat"][mask], sim["sebetahat"][mask]
-        new1 = s_lc_ash_new_level_posterior_means(b, s, panel, tau_inflate=1.0, n_epochs=300, verbose=False, seed=40)
-        new3 = s_lc_ash_new_level_posterior_means(b, s, panel, tau_inflate=3.0, n_epochs=300, verbose=False, seed=40)
+        new1 = s_lcash_new_level_posterior_means(b, s, panel, tau_inflate=1.0, n_epochs=300, verbose=False, seed=40)
+        new3 = s_lcash_new_level_posterior_means(b, s, panel, tau_inflate=3.0, n_epochs=300, verbose=False, seed=40)
         d1 = abs(math.log(float(new1.level_params["c"][0])) - mu_c)
         d3 = abs(math.log(float(new3.level_params["c"][0])) - mu_c)
         assert d3 >= d1 - 1e-3
 
-    def test_rejects_non_s_lc_ash_panel(self):
+    def test_rejects_non_s_lcash_panel(self):
         bad = cash_PosteriorMeanNorm(
             post_mean=torch.zeros(3), post_mean2=torch.zeros(3), post_sd=torch.zeros(3),
             pi_np=torch.zeros(3, 4), scale=torch.tensor([0.1, 0.2, 0.5]),
             _arch_meta={"family": "lcash"},
         )
-        with pytest.raises(ValueError, match="s_lc_ash_posterior_means"):
-            s_lc_ash_new_level_posterior_means(torch.zeros(3), torch.ones(3), bad)
+        with pytest.raises(ValueError, match="s_lcash_posterior_means"):
+            s_lcash_new_level_posterior_means(torch.zeros(3), torch.ones(3), bad)
 
     def test_single_observation_level(self):
         sim, panel = self._fit_panel()
         b = sim["betahat"][:1]
         s = sim["sebetahat"][:1]
-        new = s_lc_ash_new_level_posterior_means(b, s, panel, n_epochs=100, verbose=False, seed=42)
+        new = s_lcash_new_level_posterior_means(b, s, panel, n_epochs=100, verbose=False, seed=42)
         assert math.isfinite(new.marginal_loglik)
         c_hat = float(new.level_params["c"][0])
         mu_c = float(panel.priors_fitted[0]["mu_c"])
@@ -543,9 +543,9 @@ class TestNewLevelPosteriorMeans:
     def test_predict_pi_raises_for_single_level(self):
         sim, panel = self._fit_panel()
         mask = sim["X_cat"] == 0
-        new = s_lc_ash_new_level_posterior_means(sim["betahat"][mask], sim["sebetahat"][mask], panel,
+        new = s_lcash_new_level_posterior_means(sim["betahat"][mask], sim["sebetahat"][mask], panel,
                              n_epochs=20, verbose=False)
-        with pytest.raises(NotImplementedError, match="s_lc_ash_new_level_posterior_means"):
+        with pytest.raises(NotImplementedError, match="s_lcash_new_level_posterior_means"):
             new.predict_pi(X_cat=torch.tensor([0], dtype=torch.long))
 
 
@@ -566,8 +566,8 @@ class TestFloat32:
         se64 = torch.full((50,), 0.1, dtype=torch.float64)
         level_id = torch.randint(0, T, (50,))
 
-        log_m_64 = s_lc_ash_log_marginal(beta64, se64, level_id, log_c64, logit_p64, eta64, sigma_t64)
-        log_m_32 = s_lc_ash_log_marginal(
+        log_m_64 = s_lcash_log_marginal(beta64, se64, level_id, log_c64, logit_p64, eta64, sigma_t64)
+        log_m_32 = s_lcash_log_marginal(
             beta64.float(), se64.float(), level_id,
             log_c64.float(), logit_p64.float(), eta64.float(), sigma_t64.float(),
         )

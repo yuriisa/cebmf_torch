@@ -22,11 +22,11 @@ implementation has a single categorical covariate (level id; e.g. trait id, coho
 
 Public API:
 
-* :func:`s_lc_ash_posterior_means` — panel fit.
-* :func:`s_lc_ash_new_level_posterior_means` — cold-start a new level given a panel-trained model.
-* :class:`SLCAshNet` — per-level + shared-parameter container (``nn.Module``).
-* :func:`s_lc_ash_log_marginal` — per-observation marginal log-density kernel.
-* :func:`s_lc_ash_compute_posteriors` — per-observation posterior moments kernel.
+* :func:`s_lcash_posterior_means` — panel fit.
+* :func:`s_lcash_new_level_posterior_means` — cold-start a new level given a panel-trained model.
+* :class:`SLcashNet` — per-level + shared-parameter container (``nn.Module``).
+* :func:`s_lcash_log_marginal` — per-observation marginal log-density kernel.
+* :func:`s_lcash_compute_posteriors` — per-observation posterior moments kernel.
 
 Notes on the level-2 hyperparameter ``tau_c^2``
 -----------------------------------------------
@@ -82,7 +82,7 @@ that panel.
 
 The deployment workflow side-steps the issue by panel construction:
 restricting the panel to well-pinned high-power levels (and adding
-underpowered levels via :func:`s_lc_ash_new_level_posterior_means`) keeps the per-level
+underpowered levels via :func:`s_lcash_new_level_posterior_means`) keeps the per-level
 ``c_t`` values diverse enough that ``tau_c^2`` stays well above the
 floor. CAESER measured ``tau_c^2 = 0.115`` on the well-pinned 50-level
 subset versus ``4 x 10^-4`` on the full 246-level fit.
@@ -122,7 +122,7 @@ LOG2PI = math.log(2.0 * math.pi)
 # Module-level defaults (single source of truth).
 # ---------------------------------------------------------------------------
 # Defaults that appear in more than one public function in this module
-# (e.g. shared between :func:`s_lc_ash_posterior_means`, :func:`s_lc_ash_new_level_posterior_means`,
+# (e.g. shared between :func:`s_lcash_posterior_means`, :func:`s_lcash_new_level_posterior_means`,
 # and :func:`_warm_start_from_pooled_ash`) live here, as a single declaration,
 # so they cannot drift across signatures.
 
@@ -148,7 +148,7 @@ DEFAULT_TAU2_MIN: float = 1e-6
 # ---------------------------------------------------------------------------
 
 
-def s_lc_ash_log_marginal(
+def s_lcash_log_marginal(
     betahat: torch.Tensor,
     sebetahat: torch.Tensor,
     level_id: torch.Tensor,
@@ -223,7 +223,7 @@ def s_lc_ash_log_marginal(
     return torch.logsumexp(log_components, dim=1)
 
 
-def s_lc_ash_compute_posteriors(
+def s_lcash_compute_posteriors(
     betahat: torch.Tensor,
     sebetahat: torch.Tensor,
     level_id: torch.Tensor,
@@ -290,7 +290,7 @@ def s_lc_ash_compute_posteriors(
 # ---------------------------------------------------------------------------
 
 
-class SLCAshNet(nn.Module):
+class SLcashNet(nn.Module):
     """S-LC-ASH parameter container (single per-level dial, shared p).
 
     Trainable parameters:
@@ -451,7 +451,7 @@ def _warm_start_from_pooled_ash(
 # ---------------------------------------------------------------------------
 
 
-def s_lc_ash_posterior_means(
+def s_lcash_posterior_means(
     betahat: torch.Tensor,
     sebetahat: torch.Tensor,
     X_cat: torch.Tensor,
@@ -527,12 +527,12 @@ def s_lc_ash_posterior_means(
         * ``post_mean, post_mean2, post_sd`` (N,) per-observation moments.
         * ``pi_np`` (N, K+1) per-observation responsibilities; column 0 = spike.
         * ``scale`` (K,) slab widths.
-        * ``model_param`` SLCAshNet ``state_dict``.
-        * ``priors_fitted = {0: {"mu_c", "tau2_c", "p", "solver": "s_lc_ash_joint_adam"}}``.
+        * ``model_param`` SLcashNet ``state_dict``.
+        * ``priors_fitted = {0: {"mu_c", "tau2_c", "p", "solver": "s_lcash_joint_adam"}}``.
         * ``priors_fitted_history`` per-snapshot list, same shape.
         * ``marginal_loglik`` final panel log-likelihood under the prior.
         * ``level_params = {"c": Tensor (T,), "p": Tensor (1,)}``.
-        * ``_arch_meta = {"family": "s_lc_ash", "n_levels": int, "K": int}``.
+        * ``_arch_meta = {"family": "s_lcash", "n_levels": int, "K": int}``.
     """
     from cebmf_torch.cebnm.cash_solver import cash_PosteriorMeanNorm
 
@@ -566,7 +566,7 @@ def s_lc_ash_posterior_means(
     sigma = warm["sigma"].to(device)
     log_w = warm["log_w"].to(device)
 
-    model = SLCAshNet(
+    model = SLcashNet(
         n_levels=n_cat_levels,
         sigma=sigma,
         log_w_init=log_w,
@@ -593,7 +593,7 @@ def s_lc_ash_posterior_means(
     final_loss = float("nan")
     for epoch in range(n_epochs):
         optimizer.zero_grad()
-        log_m = s_lc_ash_log_marginal(
+        log_m = s_lcash_log_marginal(
             betahat, sebetahat, X_cat, model.log_c, model.logit_p, model.eta, model.sigma
         )
         data_loss = -log_m.sum()
@@ -638,28 +638,28 @@ def s_lc_ash_posterior_means(
         "mu_c": float(model.mu_c),
         "tau2_c": tau_c_eff ** 2,
         "p": float(torch.sigmoid(model.logit_p)),
-        "solver": "s_lc_ash_joint_adam",
+        "solver": "s_lcash_joint_adam",
     }
 
     # ---- Posteriors on the panel data using the fitted prior
     with torch.no_grad():
-        out = s_lc_ash_compute_posteriors(
+        out = s_lcash_compute_posteriors(
             betahat, sebetahat, X_cat, model.log_c, model.logit_p, model.eta, model.sigma
         )
     marginal_loglik = float(out["log_marginal"].sum().item())
 
     priors_fitted = {0: dict(psi)}
     history_wrapped: list[dict] = [
-        {0: dict(snap, solver="s_lc_ash_joint_adam")} for snap in history
+        {0: dict(snap, solver="s_lcash_joint_adam")} for snap in history
     ]
     if track_loglik_history and history_wrapped:
         history_wrapped[-1][0]["loglik_history"] = list(loglik_history)
     elif track_loglik_history:
         history_wrapped = [
-            {0: {"loglik_history": list(loglik_history), "solver": "s_lc_ash_joint_adam"}}
+            {0: {"loglik_history": list(loglik_history), "solver": "s_lcash_joint_adam"}}
         ]
 
-    arch_meta = {"family": "s_lc_ash", "n_levels": int(n_cat_levels), "K": int(sigma.numel())}
+    arch_meta = {"family": "s_lcash", "n_levels": int(n_cat_levels), "K": int(sigma.numel())}
     level_params = {
         "c": model.c().detach().cpu(),
         "p": torch.sigmoid(model.logit_p).detach().cpu().reshape(1),
@@ -686,7 +686,7 @@ def s_lc_ash_posterior_means(
 # ---------------------------------------------------------------------------
 
 
-def s_lc_ash_new_level_posterior_means(
+def s_lcash_new_level_posterior_means(
     betahat: torch.Tensor,
     sebetahat: torch.Tensor,
     panel_result,
@@ -720,7 +720,7 @@ def s_lc_ash_new_level_posterior_means(
     betahat, sebetahat : Tensor, shape (n_t,)
         New level's data (unbatched).
     panel_result : cash_PosteriorMeanNorm
-        Output of :func:`s_lc_ash_posterior_means`.
+        Output of :func:`s_lcash_posterior_means`.
     n_epochs : int, optional
         Hard cap on the optimisation budget. Default 200.
     lr : float, optional
@@ -738,7 +738,7 @@ def s_lc_ash_new_level_posterior_means(
         per outer iteration (each line-search probe), so the history is
         indexed by closure call (line-search probe), NOT by outer
         iteration or "epoch". Granularity is finer than the
-        :func:`s_lc_ash_posterior_means` history which is one entry per
+        :func:`s_lcash_posterior_means` history which is one entry per
         Adam epoch.
     device, verbose, seed : standard kwargs.
 
@@ -746,15 +746,15 @@ def s_lc_ash_new_level_posterior_means(
     -------
     cash_PosteriorMeanNorm
         Per-observation posteriors plus per-level ``c`` (1-element tensor).
-        ``_arch_meta = {"family": "s_lc_ash", "single_level": True, "K": K}``.
+        ``_arch_meta = {"family": "s_lcash", "single_level": True, "K": K}``.
     """
     from cebmf_torch.cebnm.cash_solver import cash_PosteriorMeanNorm
 
     arch_meta = getattr(panel_result, "_arch_meta", None)
-    if arch_meta is None or arch_meta.get("family") != "s_lc_ash":
+    if arch_meta is None or arch_meta.get("family") != "s_lcash":
         raise ValueError(
-            "s_lc_ash_new_level_posterior_means requires a panel_result produced by "
-            "s_lc_ash_posterior_means; got _arch_meta={!r}.".format(arch_meta)
+            "s_lcash_new_level_posterior_means requires a panel_result produced by "
+            "s_lcash_posterior_means; got _arch_meta={!r}.".format(arch_meta)
         )
     panel_priors = getattr(panel_result, "priors_fitted", None)
     if not panel_priors or 0 not in panel_priors:
@@ -798,7 +798,7 @@ def s_lc_ash_new_level_posterior_means(
 
     def closure():
         optimizer.zero_grad()
-        log_m = s_lc_ash_log_marginal(
+        log_m = s_lcash_log_marginal(
             betahat, sebetahat, level_id, log_c, logit_p, eta, sigma
         )
         data_loss = -log_m.sum()
@@ -812,7 +812,7 @@ def s_lc_ash_new_level_posterior_means(
 
     # `final_loss` records the joint MAP objective at the optimum
     # (data + prior penalty), matching the convention used by
-    # :func:`s_lc_ash_posterior_means`. We deliberately do NOT store
+    # :func:`s_lcash_posterior_means`. We deliberately do NOT store
     # `-marginal_loglik` here because that excludes the prior penalty
     # and would be inconsistent with how the panel-fit `loss` field
     # is interpreted.
@@ -827,19 +827,19 @@ def s_lc_ash_new_level_posterior_means(
         prev_loss = cur
 
     with torch.no_grad():
-        out = s_lc_ash_compute_posteriors(
+        out = s_lcash_compute_posteriors(
             betahat, sebetahat, level_id, log_c, logit_p, eta, sigma
         )
     marginal_loglik = float(out["log_marginal"].sum().item())
 
     if verbose:
         print(
-            f"[s_lc_ash_new_level_posterior_means] c={float(torch.exp(log_c[0])):.4g} "
+            f"[s_lcash_new_level_posterior_means] c={float(torch.exp(log_c[0])):.4g} "
             f"p={float(torch.sigmoid(logit_p)):.4g} "
             f"marginal_loglik={marginal_loglik:.4g}"
         )
 
-    arch_meta_out = {"family": "s_lc_ash", "single_level": True, "K": int(sigma.numel())}
+    arch_meta_out = {"family": "s_lcash", "single_level": True, "K": int(sigma.numel())}
     c_val = torch.exp(log_c.detach()).cpu()
     p_val = torch.sigmoid(logit_p.detach()).cpu().reshape(1)
     level_params = {"c": c_val, "p": p_val}
@@ -848,7 +848,7 @@ def s_lc_ash_new_level_posterior_means(
             "mu_c": mu_c,
             "tau2_c": tau2_c,
             "p": float(p_val[0]),
-            "solver": "s_lc_ash_cold_start",
+            "solver": "s_lcash_cold_start",
             "frozen_from_panel": True,
             "tau_inflate": float(tau_inflate),
         }
@@ -856,7 +856,7 @@ def s_lc_ash_new_level_posterior_means(
     history_wrapped: list[dict] = []
     if track_loglik_history:
         history_wrapped = [{0: {"loglik_history": loglik_history,
-                                  "solver": "s_lc_ash_cold_start"}}]
+                                  "solver": "s_lcash_cold_start"}}]
 
     return cash_PosteriorMeanNorm(
         post_mean=out["post_mean"].detach().cpu(),
@@ -880,9 +880,9 @@ def s_lc_ash_new_level_posterior_means(
 
 
 __all__ = [
-    "SLCAshNet",
-    "s_lc_ash_compute_posteriors",
-    "s_lc_ash_log_marginal",
-    "s_lc_ash_new_level_posterior_means",
-    "s_lc_ash_posterior_means",
+    "SLcashNet",
+    "s_lcash_compute_posteriors",
+    "s_lcash_log_marginal",
+    "s_lcash_new_level_posterior_means",
+    "s_lcash_posterior_means",
 ]
