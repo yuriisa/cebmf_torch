@@ -304,7 +304,7 @@ def _install_reference_gauge(
 # ============================================================
 
 
-def fit_normal(coeffs: torch.Tensor, tau2_min: float = 1e-6) -> dict:
+def _fit_normal(coeffs: torch.Tensor, tau2_min: float = 1e-6) -> dict:
     """Level-2 fitter for the Normal prior.
 
     Calls :func:`cebmf_torch.ebnm.ebnm_normal` with ``sebetahat=None``
@@ -322,7 +322,7 @@ def fit_normal(coeffs: torch.Tensor, tau2_min: float = 1e-6) -> dict:
     return {"tau2": res.tau2}
 
 
-def logp_normal(theta: torch.Tensor, psi: dict) -> torch.Tensor:
+def _logp_normal(theta: torch.Tensor, psi: dict) -> torch.Tensor:
     """Differentiable log-density of g = N(0, tau2), summed over theta entries.
 
     Returns a scalar Tensor with autograd flowing through ``theta``.
@@ -682,7 +682,7 @@ def _train_model(
     - **M-step**: gradient descent for ``prior_refit_every`` epochs, with
       the cached ``priors_state`` contributing a Level-2 regulariser
       ``(|B|/N) * R_d`` per minibatch (Section 6.7) once warm-up is over.
-    - **E-step**: refit the Level-2 prior by calling :func:`fit_normal`
+    - **E-step**: refit the Level-2 prior by calling :func:`_fit_normal`
       on ``model.cat[d].weight[1:].detach().flatten()`` (row 0 excluded
       per the gauge, Section 6.5).
 
@@ -797,7 +797,7 @@ def _train_model(
                         keep_mask[ref_d] = False
                         coeffs = model.cat[d].weight[keep_mask]
                         if prior_name == "normal":
-                            R = -logp_normal(coeffs, psi)
+                            R = -_logp_normal(coeffs, psi)
                         else:
                             # _normalise_cat_prior should have caught this.
                             raise ValueError(f"Unsupported Level-2 solver: {prior_name!r}")
@@ -832,7 +832,7 @@ def _train_model(
                 keep_mask[ref_d] = False
                 coeffs = model.cat[d].weight[keep_mask].detach().flatten()
                 if prior_name == "normal":
-                    psi = fit_normal(coeffs, tau2_min=tau2_min)
+                    psi = _fit_normal(coeffs, tau2_min=tau2_min)
                 else:
                     raise ValueError(f"Unsupported Level-2 solver: {prior_name!r}")
                 priors_state[d] = psi
@@ -1317,7 +1317,7 @@ def lcash_posterior_means(
         Number of M-step epochs between successive E-steps.  Default 10.
     tau2_min : float, keyword-only
         Lower bound on the fitted ``tau2`` for the Normal Level-2 prior.
-        Plumbed through to :func:`fit_normal` and :func:`ebnm_normal`.
+        Plumbed through to :func:`_fit_normal` and :func:`ebnm_normal`.
         Default ``1e-6`` prevents the degenerate sink at ``tau2 = 0``.
     prior_tol : float or None, keyword-only
         Relative-change tolerance on log(tau2) for early-stopping the

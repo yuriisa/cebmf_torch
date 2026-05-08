@@ -99,7 +99,7 @@ class cash_PosteriorMeanNorm:
         x_means: torch.Tensor | None = None,
         x_stds: torch.Tensor | None = None,
         _arch_meta: dict | None = None,
-        trait_params: dict | None = None,
+        level_params: dict | None = None,
     ):
         """
         Container for the results of the CASH posterior mean estimation.
@@ -158,19 +158,19 @@ class cash_PosteriorMeanNorm:
             list[int]}``) needed by :meth:`predict_pi` to rebuild the
             net without re-deriving the architecture from the
             ``state_dict``. The S-LC-ASH training entry points populate
-            it with ``{"family": "s_lc_ash", "T": int, "K": int}`` (or
-            ``{"family": "s_lc_ash", "single_trait": True, "K": int}``
+            it with ``{"family": "s_lc_ash", "n_levels": int, "K": int}`` (or
+            ``{"family": "s_lc_ash", "single_level": True, "K": int}``
             for cold-start results) and :meth:`predict_pi` raises
             :class:`NotImplementedError` for that family with a pointer
-            to :func:`fit_new_trait`. ``None`` is supported for backwards
+            to :func:`s_lc_ash_new_level_posterior_means`. ``None`` is supported for backwards
             compatibility with older pickled results; in that case
             :meth:`predict_pi` falls back to ``state_dict`` introspection.
-        trait_params : dict or None, optional
-            Per-trait scalar parameters fitted by the S-LC-ASH family:
+        level_params : dict or None, optional
+            Per-level scalar parameters fitted by the S-LC-ASH family:
             ``{"c": Tensor (T,), "p": Tensor (1,)}`` where ``c`` is per
-            trait and ``p`` is the shared spike weight. ``None`` for
-            LC-ASH and other families that do not parameterise traits
-            as scalars.
+            level (one entry per level of the categorical covariate) and
+            ``p`` is the shared spike weight. ``None`` for LC-ASH and
+            other families that do not parameterise levels as scalars.
         """
         self.post_mean = post_mean
         self.post_mean2 = post_mean2
@@ -185,7 +185,7 @@ class cash_PosteriorMeanNorm:
         self._x_means = x_means
         self._x_stds = x_stds
         self._arch_meta = _arch_meta
-        self.trait_params = trait_params
+        self.level_params = level_params
 
     def predict_pi(
         self,
@@ -261,14 +261,15 @@ class cash_PosteriorMeanNorm:
             raise NotImplementedError(
                 "predict_pi is not implemented for the S-LC-ASH family. "
                 "Two supported paths to score new data: "
-                "(1) for genes from a NEW trait, call "
-                "cebmf_torch.cebnm.fit_new_trait(betahat, sebetahat, panel_result) "
-                "to fit a per-trait c_t and obtain posteriors via "
+                "(1) for genes from a NEW level (a level of the categorical "
+                "covariate that was not present in the panel), call "
+                "cebmf_torch.cebnm.s_lc_ash_new_level_posterior_means(betahat, sebetahat, panel_result) "
+                "to fit a per-level c_t and obtain posteriors via "
                 "s_lc_ash_compute_posteriors; "
-                "(2) for genes from a trait that WAS in the panel (or any "
+                "(2) for genes from a level that WAS in the panel (or any "
                 "scoring with known c_t and shared p), call "
                 "cebmf_torch.cebnm.s_lc_ash.s_lc_ash_compute_posteriors(...) "
-                "directly with the per-trait log_c, the shared logit_p, the "
+                "directly with the per-level log_c, the shared logit_p, the "
                 "shared eta and sigma read off panel_result.model_param."
             )
         if arch_meta is not None:

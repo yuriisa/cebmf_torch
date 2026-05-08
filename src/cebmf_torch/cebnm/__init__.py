@@ -6,16 +6,16 @@ from .cov_gb_prior import cgb_posterior_means
 from .cov_sharp_gb_prior import sharp_cgb_posterior_means
 from .emdn import emdn_posterior_means
 from .lcash import lcash_posterior_means, po_lcash_posterior_means
-from .s_lc_ash import fit_new_trait, s_lc_ash_posterior_means
+from .s_lc_ash import s_lc_ash_new_level_posterior_means, s_lc_ash_posterior_means
 from .spiked_emdn import spiked_emdn_posterior_means
 
 __all__ = [
     "cash_posterior_means",
     "cgb_posterior_means",
     "emdn_posterior_means",
-    "fit_new_trait",
     "lcash_posterior_means",
     "po_lcash_posterior_means",
+    "s_lc_ash_new_level_posterior_means",
     "s_lc_ash_posterior_means",
     "sharp_cgb_posterior_means",
     "spiked_emdn_posterior_means",

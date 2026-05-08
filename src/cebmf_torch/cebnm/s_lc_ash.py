@@ -1,6 +1,6 @@
 """S-LC-ASH: Scaled Linear Covariate-mediated Adaptive Shrinkage.
 
-Per-trait spike-and-slab where the slab scale ``c_t`` is per-trait and
+Per-level spike-and-slab where the slab scale ``c_t`` is per-level and
 everything else is shared:
 
 .. math::
@@ -10,24 +10,23 @@ everything else is shared:
 
 * ``p`` (scalar) — shared spike weight (fraction of null genes, panel-wide).
 * ``w_k``, ``sigma_k`` — shared slab weights and widths.
-* ``c_t > 0`` — per-trait scale on the slab widths. Hyperprior
+* ``c_t > 0`` — per-level scale on the slab widths. Hyperprior
   ``log c_t ~ N(mu_c, tau_c^2)`` with ``mu_c`` and ``tau_c^2`` empirical-Bayes
   fitted (jointly with everything else by Adam, by default).
 
-The model is a one-dial per-trait extension of pooled `ash` and matches the
+The model is a one-dial per-level extension of pooled `ash` and matches the
 sister-project ``beta_pool_scale`` parameterisation. The "LC" in the name
 keeps the door open for covariate dependence on ``c_t`` in a future PR
 (e.g. phenotype-class regulating ``log c`` linearly); the present
-implementation has a single categorical covariate (trait id).
+implementation has a single categorical covariate (level id; e.g. trait id, cohort id, tissue id).
 
 Public API:
 
 * :func:`s_lc_ash_posterior_means` — panel fit.
-* :func:`fit_new_trait` — cold-start a new trait given a panel-trained model.
-* :class:`SLCAshNet` — per-trait + shared-parameter container (``nn.Module``).
+* :func:`s_lc_ash_new_level_posterior_means` — cold-start a new level given a panel-trained model.
+* :class:`SLCAshNet` — per-level + shared-parameter container (``nn.Module``).
 * :func:`s_lc_ash_log_marginal` — per-observation marginal log-density kernel.
 * :func:`s_lc_ash_compute_posteriors` — per-observation posterior moments kernel.
-* :func:`warm_start_from_pooled_ash` — slab + pooled-spike warm-start helper.
 
 Notes on the level-2 hyperparameter ``tau_c^2``
 -----------------------------------------------
@@ -36,7 +35,7 @@ The level-2 prior on ``log c_t`` is a free-mean Normal
 ``N(mu_c, tau_c^2)`` with ``mu_c`` and ``log tau_c`` learnable
 parameters optimised jointly with everything else under a single
 Adam loop. The minimised loss (negative log-prior, summed over the
-``T`` traits) decomposes into two terms whose gradients on
+``T`` levels) decomposes into two terms whose gradients on
 ``log_tau_c`` act in opposite directions:
 
 * The normaliser ``+T * log(tau_c)``. Gradient ``+T``. In a
@@ -45,7 +44,7 @@ Adam loop. The minimised loss (negative log-prior, summed over the
 * The quadratic residual ``+sum_t (log c_t - mu_c)^2 / (2 tau_c^2)``.
   Gradient ``-sum_t (log c_t - mu_c)^2 / tau_c^2``. Adam moves
   ``log_tau_c`` *up*. This is the term that resists collapse, and
-  it does so **only when per-trait ``log c_t`` values diverge from
+  it does so **only when per-level ``log c_t`` values diverge from
   ``mu_c``**.
 
 The two terms balance at ``tau_c^2 = (1/T) sum_t (log c_t - mu_c)^2``
@@ -58,19 +57,19 @@ the optimisation numerically well-behaved when this happens. The
 practical advantage of joint Adam over closed-form alternating
 empirical Bayes is dynamic stability: alternating EB sets
 ``tau_c^2`` to the empirical variance instantly each E-step and can
-oscillate or overshoot toward the floor when per-trait values are
+oscillate or overshoot toward the floor when per-level values are
 momentarily clustered; joint Adam smooths the trajectory.
 
 The floor is implemented smoothly as
 ``tau_c = sqrt(tau2_min + exp(2 * log_tau_c))`` rather than as a
 hard ``clamp(min=sqrt(tau2_min))``. With the smooth floor,
-gradients on ``log_tau_c`` flow at all values, so if per-trait
+gradients on ``log_tau_c`` flow at all values, so if per-level
 heterogeneity later emerges the optimiser can recover ``tau_c``
 above the floor; with a hard clamp the gradient through ``tau_c``
 is zero below the floor and recovery is impossible.
 
-This was observed by the CAESER 246-trait validation in both
-training directions: the per-trait ``c_t`` values clustered tightly
+This was observed by the CAESER 246-level validation in both
+training directions: the per-level ``c_t`` values clustered tightly
 around the panel mean (range ``[0.949, 0.966]`` on UKB-trained,
 ``[0.984, 0.986]`` on AGD-trained), and ``tau_c^2`` collapsed to
 ``~10^-6`` over a few hundred epochs. The marginal log-likelihood
@@ -78,31 +77,31 @@ decreased by tens of nats panel-total over a 1500-epoch fit,
 matching the diagnostic signature of misspecified-prior collapse,
 **but the predictive impact is negligible** (paired test LPD changes
 by ``~10^-5``). The model degrades gracefully to "pooled ASH plus
-shared spike" in this regime, which itself beats per-trait ASH on
+shared spike" in this regime, which itself beats per-level ASH on
 that panel.
 
 The deployment workflow side-steps the issue by panel construction:
-restricting the panel to well-pinned high-power traits (and adding
-underpowered traits via :func:`fit_new_trait`) keeps the per-trait
+restricting the panel to well-pinned high-power levels (and adding
+underpowered levels via :func:`s_lc_ash_new_level_posterior_means`) keeps the per-level
 ``c_t`` values diverse enough that ``tau_c^2`` stays well above the
-floor. CAESER measured ``tau_c^2 = 0.115`` on the well-pinned 50-trait
-subset versus ``4 x 10^-4`` on the full 246-trait fit.
+floor. CAESER measured ``tau_c^2 = 0.115`` on the well-pinned 50-level
+subset versus ``4 x 10^-4`` on the full 246-level fit.
 
 A consequence of the **free-mean** parameterisation: any panel-wide
 multiplicative shift in slab width is absorbed into ``mu_c`` rather
-than into the per-trait ``c_t`` values, so the per-trait ``c_t``
+than into the per-level ``c_t`` values, so the per-level ``c_t``
 spread is narrower than what an **anchored** parameterisation (e.g.
 geometric-mean-1 constraint on ``log c_t``) would give. This is a
 parameterisation choice, not a fitting failure: the predictive
 content is identical, and the CAESER R-side analogue
 ``beta_pool_scale`` (which uses an anchor) reproduces the predictive
-numbers of S-LC-ASH to within FP noise on the 246-trait panel. If
+numbers of S-LC-ASH to within FP noise on the 246-level panel. If
 interpretability of ``c_t`` as an absolute multiplier matters
 downstream, an anchored variant is a natural follow-up.
 
 Users diagnosing a single ``tau_c^2`` quote should therefore not
 treat a small value as evidence of optimisation failure; check the
-per-trait ``c_t`` spread first. If ``c_t`` values are narrow and
+per-level ``c_t`` spread first. If ``c_t`` values are narrow and
 predictives are good, the optimum is genuinely homogeneous and the
 collapse is the right answer.
 """
@@ -123,8 +122,8 @@ LOG2PI = math.log(2.0 * math.pi)
 # Module-level defaults (single source of truth).
 # ---------------------------------------------------------------------------
 # Defaults that appear in more than one public function in this module
-# (e.g. shared between :func:`s_lc_ash_posterior_means`, :func:`fit_new_trait`,
-# and :func:`warm_start_from_pooled_ash`) live here, as a single declaration,
+# (e.g. shared between :func:`s_lc_ash_posterior_means`, :func:`s_lc_ash_new_level_posterior_means`,
+# and :func:`_warm_start_from_pooled_ash`) live here, as a single declaration,
 # so they cannot drift across signatures.
 
 #: Multiplicative step between adjacent slab-grid widths in the autoselect
@@ -152,7 +151,7 @@ DEFAULT_TAU2_MIN: float = 1e-6
 def s_lc_ash_log_marginal(
     betahat: torch.Tensor,
     sebetahat: torch.Tensor,
-    trait_id: torch.Tensor,
+    level_id: torch.Tensor,
     log_c: torch.Tensor,
     logit_p: torch.Tensor,
     eta: torch.Tensor,
@@ -168,7 +167,7 @@ def s_lc_ash_log_marginal(
               \\mathcal{N}\\bigl(\\hat\\beta_g\\mid 0,\\, c_t^2\\sigma_k^2 + s_g^2\\bigr)
         \\Big)
 
-    where ``t = trait_id[g]``, ``c_t = exp(log_c[t])``, ``p = sigmoid(logit_p)``,
+    where ``t = level_id[g]``, ``c_t = exp(log_c[t])``, ``p = sigmoid(logit_p)``,
     ``w_k = softmax(eta)_k``. Computed via ``logsumexp`` over (K + 1) components.
 
     Parameters
@@ -177,10 +176,10 @@ def s_lc_ash_log_marginal(
         Observed effect estimates.
     sebetahat : Tensor, shape (N,)
         Standard errors. Strictly positive.
-    trait_id : Tensor, shape (N,), dtype long
-        Per-observation trait index in ``[0, T)``.
+    level_id : Tensor, shape (N,), dtype long
+        Per-observation level index in ``[0, T)``.
     log_c : Tensor, shape (T,)
-        Per-trait log-scale.
+        Per-level log-scale.
     logit_p : Tensor, scalar (0-d) or shape (1,)
         Shared spike weight on the logit scale.
     eta : Tensor, shape (K,)
@@ -201,7 +200,7 @@ def s_lc_ash_log_marginal(
             "Strip the spike entry (sigma=0) before calling."
         )
 
-    log_c_g = log_c.index_select(0, trait_id)  # (N,)
+    log_c_g = log_c.index_select(0, level_id)  # (N,)
     c_g = torch.exp(log_c_g)
     log_p = torch.nn.functional.logsigmoid(logit_p)
     log_1mp = torch.nn.functional.logsigmoid(-logit_p)
@@ -227,7 +226,7 @@ def s_lc_ash_log_marginal(
 def s_lc_ash_compute_posteriors(
     betahat: torch.Tensor,
     sebetahat: torch.Tensor,
-    trait_id: torch.Tensor,
+    level_id: torch.Tensor,
     log_c: torch.Tensor,
     logit_p: torch.Tensor,
     eta: torch.Tensor,
@@ -244,7 +243,7 @@ def s_lc_ash_compute_posteriors(
     if torch.any(sigma <= 0):
         raise ValueError("sigma must contain only strictly positive slab widths.")
 
-    log_c_g = log_c.index_select(0, trait_id)
+    log_c_g = log_c.index_select(0, level_id)
     c_g = torch.exp(log_c_g)
     log_p = torch.nn.functional.logsigmoid(logit_p)
     log_1mp = torch.nn.functional.logsigmoid(-logit_p)
@@ -287,16 +286,16 @@ def s_lc_ash_compute_posteriors(
 
 
 # ---------------------------------------------------------------------------
-# Per-trait + shared-parameter container.
+# Per-level + shared-parameter container.
 # ---------------------------------------------------------------------------
 
 
 class SLCAshNet(nn.Module):
-    """S-LC-ASH parameter container (single per-trait dial, shared p).
+    """S-LC-ASH parameter container (single per-level dial, shared p).
 
     Trainable parameters:
 
-    * ``log_c`` (T,) — per-trait log-scale.
+    * ``log_c`` (T,) — per-level log-scale.
     * ``logit_p`` () scalar — shared spike weight on the logit scale.
     * ``eta`` (K,) — pre-softmax shared slab weights.
     * ``mu_c`` (), ``log_tau_c`` () — level-2 hyperparameters of the
@@ -309,7 +308,7 @@ class SLCAshNet(nn.Module):
 
     def __init__(
         self,
-        n_traits: int,
+        n_levels: int,
         sigma: torch.Tensor,
         log_w_init: torch.Tensor,
         logit_p_init: float,
@@ -318,8 +317,8 @@ class SLCAshNet(nn.Module):
         dtype: torch.dtype = torch.float64,
     ):
         super().__init__()
-        if n_traits < 1:
-            raise ValueError(f"n_traits must be >= 1; got {n_traits}.")
+        if n_levels < 1:
+            raise ValueError(f"n_levels must be >= 1; got {n_levels}.")
         sigma_t = torch.as_tensor(sigma, dtype=dtype)
         if sigma_t.ndim != 1 or sigma_t.numel() < 1:
             raise ValueError(f"sigma must be 1-D with K >= 1; got shape {tuple(sigma_t.shape)}.")
@@ -332,10 +331,10 @@ class SLCAshNet(nn.Module):
                 f"sigma shape {tuple(sigma_t.shape)}."
             )
 
-        self.n_traits = int(n_traits)
+        self.n_levels = int(n_levels)
         self.K = int(sigma_t.numel())
 
-        self.log_c = nn.Parameter(torch.full((n_traits,), float(log_c_init), dtype=dtype))
+        self.log_c = nn.Parameter(torch.full((n_levels,), float(log_c_init), dtype=dtype))
         self.logit_p = nn.Parameter(torch.tensor(float(logit_p_init), dtype=dtype))
         self.eta = nn.Parameter(log_w_init_t.clone())
         self.mu_c = nn.Parameter(torch.tensor(0.0, dtype=dtype))
@@ -348,7 +347,7 @@ class SLCAshNet(nn.Module):
         return torch.softmax(self.eta, dim=0)
 
     def c(self) -> torch.Tensor:
-        """Per-trait scale ``exp(log_c)``."""
+        """Per-level scale ``exp(log_c)``."""
         return torch.exp(self.log_c)
 
     def p(self) -> torch.Tensor:
@@ -370,7 +369,7 @@ class SLCAshNet(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-def warm_start_from_pooled_ash(
+def _warm_start_from_pooled_ash(
     betahat: torch.Tensor,
     sebetahat: torch.Tensor,
     *,
@@ -471,7 +470,7 @@ def s_lc_ash_posterior_means(
     verbose: bool = True,
     seed: int = 42,
 ):
-    """Fit S-LC-ASH on a multi-trait panel.
+    """Fit S-LC-ASH on a multi-level panel.
 
     Minimises the negative log marginal joint
 
@@ -483,7 +482,7 @@ def s_lc_ash_posterior_means(
     over ``log_c`` (T,), ``logit_p`` (), ``eta`` (K,), ``mu_c`` (), and
     ``log_tau_c`` () jointly under a single Adam optimiser. The level-2
     quadratic term ``+sum_t (log c_t - mu_c)^2 / (2 tau_c^2)`` resists
-    ``tau_c -> 0`` collapse when per-trait ``log c_t`` values diverge
+    ``tau_c -> 0`` collapse when per-level ``log c_t`` values diverge
     from ``mu_c``; the ``+T*log(tau_c)`` normaliser drives ``tau_c``
     down, and the two balance at ``tau_c^2 = empirical variance``. See
     the module docstring for the panel-dependence caveats.
@@ -495,9 +494,9 @@ def s_lc_ash_posterior_means(
     sebetahat : Tensor, shape (N,)
         Pooled standard errors (strictly positive).
     X_cat : Tensor, shape (N,), dtype long
-        Per-observation trait index in ``[0, n_cat_levels)``.
+        Per-observation level index in ``[0, n_cat_levels)``.
     n_cat_levels : int
-        Number of distinct traits in the panel.
+        Number of distinct levels in the panel.
     n_epochs : int, optional
         Adam steps (default 500).
     lr : float, optional
@@ -508,7 +507,7 @@ def s_lc_ash_posterior_means(
         Floor on ``tau_c^2`` (default :data:`DEFAULT_TAU2_MIN`). Applied
         as a soft floor via ``exp(log_tau_c).clamp(min=sqrt(tau2_min))``.
     mult, ash_threshold, ash_init : optional
-        Forwarded to :func:`warm_start_from_pooled_ash`. Defaults are the
+        Forwarded to :func:`_warm_start_from_pooled_ash`. Defaults are the
         module-level constants :data:`DEFAULT_GRID_MULT`,
         :data:`DEFAULT_ASH_THRESHOLD`, :data:`DEFAULT_ASH_INIT`.
     snapshot_every : int, optional
@@ -532,8 +531,8 @@ def s_lc_ash_posterior_means(
         * ``priors_fitted = {0: {"mu_c", "tau2_c", "p", "solver": "s_lc_ash_joint_adam"}}``.
         * ``priors_fitted_history`` per-snapshot list, same shape.
         * ``marginal_loglik`` final panel log-likelihood under the prior.
-        * ``trait_params = {"c": Tensor (T,), "p": Tensor (1,)}``.
-        * ``_arch_meta = {"family": "s_lc_ash", "T": int, "K": int}``.
+        * ``level_params = {"c": Tensor (T,), "p": Tensor (1,)}``.
+        * ``_arch_meta = {"family": "s_lc_ash", "n_levels": int, "K": int}``.
     """
     from cebmf_torch.cebnm.cash_solver import cash_PosteriorMeanNorm
 
@@ -561,14 +560,14 @@ def s_lc_ash_posterior_means(
         )
 
     # ---- Warm start (pooled-ASH fit gives slab grid + weights + pooled spike)
-    warm = warm_start_from_pooled_ash(
+    warm = _warm_start_from_pooled_ash(
         betahat, sebetahat, mult=mult, ash_threshold=ash_threshold, ash_init=ash_init
     )
     sigma = warm["sigma"].to(device)
     log_w = warm["log_w"].to(device)
 
     model = SLCAshNet(
-        n_traits=n_cat_levels,
+        n_levels=n_cat_levels,
         sigma=sigma,
         log_w_init=log_w,
         logit_p_init=warm["logit_p_init"],
@@ -586,7 +585,7 @@ def s_lc_ash_posterior_means(
     # At all values of log_tau_c the gradient flows; for very negative
     # log_tau_c the formula asymptotes to sqrt(tau2_min) (the floor).
     # A hard `clamp(min=...)` would zero the gradient through tau_c
-    # below the floor and prevent recovery if per-trait heterogeneity
+    # below the floor and prevent recovery if per-level heterogeneity
     # later emerges.
     tau2_min_t = torch.tensor(max(tau2_min, 1e-300), dtype=torch.float64, device=device)
     history: list[dict] = []
@@ -599,7 +598,7 @@ def s_lc_ash_posterior_means(
         )
         data_loss = -log_m.sum()
         # Level-2 prior: log c_t ~ N(mu_c, tau_c^2).
-        # Negative log-prob summed over T traits =
+        # Negative log-prob summed over T levels =
         #   +T * log(tau_c)                    (drives tau_c down)
         # + sum_t (log c_t - mu_c)^2 / (2 tau_c^2)  (resists tau_c -> 0
         #                                          when log_c_t differs
@@ -660,8 +659,8 @@ def s_lc_ash_posterior_means(
             {0: {"loglik_history": list(loglik_history), "solver": "s_lc_ash_joint_adam"}}
         ]
 
-    arch_meta = {"family": "s_lc_ash", "T": int(n_cat_levels), "K": int(sigma.numel())}
-    trait_params = {
+    arch_meta = {"family": "s_lc_ash", "n_levels": int(n_cat_levels), "K": int(sigma.numel())}
+    level_params = {
         "c": model.c().detach().cpu(),
         "p": torch.sigmoid(model.logit_p).detach().cpu().reshape(1),
     }
@@ -678,7 +677,7 @@ def s_lc_ash_posterior_means(
         priors_fitted_history=history_wrapped,
         marginal_loglik=marginal_loglik,
         _arch_meta=arch_meta,
-        trait_params=trait_params,
+        level_params=level_params,
     )
 
 
@@ -687,7 +686,7 @@ def s_lc_ash_posterior_means(
 # ---------------------------------------------------------------------------
 
 
-def fit_new_trait(
+def s_lc_ash_new_level_posterior_means(
     betahat: torch.Tensor,
     sebetahat: torch.Tensor,
     panel_result,
@@ -701,7 +700,7 @@ def fit_new_trait(
     verbose: bool = False,
     seed: int = 42,
 ):
-    """Cold-start a single new trait given a panel-trained S-LC-ASH model.
+    """Cold-start a single new level given a panel-trained S-LC-ASH model.
 
     Solves a one-parameter MAP problem for ``log c_new`` with the panel's
     Layer-B parameters (``mu_c``, ``tau_c^2``, ``logit_p``, ``eta``, ``sigma``)
@@ -719,7 +718,7 @@ def fit_new_trait(
     Parameters
     ----------
     betahat, sebetahat : Tensor, shape (n_t,)
-        New trait's data (unbatched).
+        New level's data (unbatched).
     panel_result : cash_PosteriorMeanNorm
         Output of :func:`s_lc_ash_posterior_means`.
     n_epochs : int, optional
@@ -731,7 +730,7 @@ def fit_new_trait(
     tau_inflate : float, optional
         Multiplicative inflation on the deployment-time prior spread
         ``tau_c`` (default 1.0). Larger values widen the prior on a new
-        trait when the panel-fitted ``tau_c`` is too tight to represent
+        level when the panel-fitted ``tau_c`` is too tight to represent
         deployment-time variability.
     track_loglik_history : bool, optional
         Record per-closure-call data marginal log-likelihood. With
@@ -746,15 +745,15 @@ def fit_new_trait(
     Returns
     -------
     cash_PosteriorMeanNorm
-        Per-observation posteriors plus per-trait ``c`` (1-element tensor).
-        ``_arch_meta = {"family": "s_lc_ash", "single_trait": True, "K": K}``.
+        Per-observation posteriors plus per-level ``c`` (1-element tensor).
+        ``_arch_meta = {"family": "s_lc_ash", "single_level": True, "K": K}``.
     """
     from cebmf_torch.cebnm.cash_solver import cash_PosteriorMeanNorm
 
     arch_meta = getattr(panel_result, "_arch_meta", None)
     if arch_meta is None or arch_meta.get("family") != "s_lc_ash":
         raise ValueError(
-            "fit_new_trait requires a panel_result produced by "
+            "s_lc_ash_new_level_posterior_means requires a panel_result produced by "
             "s_lc_ash_posterior_means; got _arch_meta={!r}.".format(arch_meta)
         )
     panel_priors = getattr(panel_result, "priors_fitted", None)
@@ -784,7 +783,7 @@ def fit_new_trait(
     if torch.any(sebetahat <= 0):
         raise ValueError("sebetahat must be strictly positive.")
     n_new = betahat.numel()
-    trait_id = torch.zeros(n_new, dtype=torch.long, device=device)
+    level_id = torch.zeros(n_new, dtype=torch.long, device=device)
 
     log_c = torch.tensor([mu_c], dtype=torch.float64, device=device, requires_grad=True)
 
@@ -800,7 +799,7 @@ def fit_new_trait(
     def closure():
         optimizer.zero_grad()
         log_m = s_lc_ash_log_marginal(
-            betahat, sebetahat, trait_id, log_c, logit_p, eta, sigma
+            betahat, sebetahat, level_id, log_c, logit_p, eta, sigma
         )
         data_loss = -log_m.sum()
         pen = -hyper.log_prob(log_c[0])
@@ -829,21 +828,21 @@ def fit_new_trait(
 
     with torch.no_grad():
         out = s_lc_ash_compute_posteriors(
-            betahat, sebetahat, trait_id, log_c, logit_p, eta, sigma
+            betahat, sebetahat, level_id, log_c, logit_p, eta, sigma
         )
     marginal_loglik = float(out["log_marginal"].sum().item())
 
     if verbose:
         print(
-            f"[fit_new_trait] c={float(torch.exp(log_c[0])):.4g} "
+            f"[s_lc_ash_new_level_posterior_means] c={float(torch.exp(log_c[0])):.4g} "
             f"p={float(torch.sigmoid(logit_p)):.4g} "
             f"marginal_loglik={marginal_loglik:.4g}"
         )
 
-    arch_meta_out = {"family": "s_lc_ash", "single_trait": True, "K": int(sigma.numel())}
+    arch_meta_out = {"family": "s_lc_ash", "single_level": True, "K": int(sigma.numel())}
     c_val = torch.exp(log_c.detach()).cpu()
     p_val = torch.sigmoid(logit_p.detach()).cpu().reshape(1)
-    trait_params = {"c": c_val, "p": p_val}
+    level_params = {"c": c_val, "p": p_val}
     priors_fitted = {
         0: {
             "mu_c": mu_c,
@@ -876,15 +875,14 @@ def fit_new_trait(
         priors_fitted_history=history_wrapped,
         marginal_loglik=marginal_loglik,
         _arch_meta=arch_meta_out,
-        trait_params=trait_params,
+        level_params=level_params,
     )
 
 
 __all__ = [
     "SLCAshNet",
-    "s_lc_ash_log_marginal",
     "s_lc_ash_compute_posteriors",
-    "warm_start_from_pooled_ash",
+    "s_lc_ash_log_marginal",
+    "s_lc_ash_new_level_posterior_means",
     "s_lc_ash_posterior_means",
-    "fit_new_trait",
 ]

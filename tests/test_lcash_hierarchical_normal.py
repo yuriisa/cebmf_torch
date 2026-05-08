@@ -159,7 +159,7 @@ def test_normal_prior_consistency_with_emstep():
 
     This is a closed-form check on the *fitter* (not the optimisation).
     The reported tau2 in priors_fitted must equal the empirical second
-    moment over rows 1..T-1, since fit_normal calls ebnm_normal with
+    moment over rows 1..T-1, since _fit_normal calls ebnm_normal with
     sebetahat=None which has the closed-form ML tau2 = mean(beta^2).
     """
     torch.manual_seed(0)
@@ -348,7 +348,7 @@ def test_batchsize_invariance():
     """
     from torch.utils.data import DataLoader, TensorDataset
 
-    from cebmf_torch.cebnm.lcash import LcashNet, _install_reference_gauge, logp_normal
+    from cebmf_torch.cebnm.lcash import LcashNet, _install_reference_gauge, _logp_normal
 
     torch.manual_seed(0)
     T = 20
@@ -386,7 +386,7 @@ def test_batchsize_invariance():
             net.cat[0].weight.grad = None
             batch_size_actual = idx.shape[0]
             scale_factor = batch_size_actual / n  # this is the rule under test
-            R = -logp_normal(net.cat[0].weight[1:], psi)
+            R = -_logp_normal(net.cat[0].weight[1:], psi)
             (scale_factor * R).backward()
             accum = accum + net.cat[0].weight.grad.detach().clone()
         grad_sums[bs] = accum
