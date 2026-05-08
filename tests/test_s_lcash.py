@@ -15,8 +15,10 @@ from scipy import stats as sps
 
 from cebmf_torch.cebnm import s_lcash_new_level_posterior_means, s_lcash_posterior_means
 from cebmf_torch.cebnm.cash_solver import cash_PosteriorMeanNorm
+from cebmf_torch.cebnm.lcash import lcash_PosteriorMeanNorm
 from cebmf_torch.cebnm.s_lcash import (
     SLcashNet,
+    slcash_PosteriorMeanNorm,
     s_lcash_compute_posteriors,
     s_lcash_log_marginal,
     _warm_start_from_pooled_ash,
@@ -520,7 +522,7 @@ class TestNewLevelPosteriorMeans:
         assert d3 >= d1 - 1e-3
 
     def test_rejects_non_s_lcash_panel(self):
-        bad = cash_PosteriorMeanNorm(
+        bad = lcash_PosteriorMeanNorm(
             post_mean=torch.zeros(3), post_mean2=torch.zeros(3), post_sd=torch.zeros(3),
             pi_np=torch.zeros(3, 4), scale=torch.tensor([0.1, 0.2, 0.5]),
             _arch_meta={"family": "lcash"},

@@ -114,9 +114,124 @@ import torch
 from torch import nn
 from torch.distributions import Normal
 
+from cebmf_torch.cebnm.lcash import lcash_PosteriorMeanNorm
 from cebmf_torch.ebnm.ash import PriorType, ash
 
 LOG2PI = math.log(2.0 * math.pi)
+
+
+# ---------------------------------------------------------------------------
+# Result container.
+# ---------------------------------------------------------------------------
+
+
+class slcash_PosteriorMeanNorm(lcash_PosteriorMeanNorm):
+    """Result container for the S-LC-ASH family.
+
+    Extends :class:`cebmf_torch.cebnm.lcash.lcash_PosteriorMeanNorm` with
+    one extra field, :attr:`level_params`, carrying the per-level scalar
+    ``c_t`` and shared spike weight ``p`` produced by the S-LC-ASH joint
+    Adam fit (or by the cold-start L-BFGS fit for a single new level).
+
+    The :meth:`predict_pi` method inherited from the LC-ASH parent does
+    not apply here because S-LC-ASH does not parameterise the prior via
+    a softmax/proportional-odds network of features. This subclass
+    overrides :meth:`predict_pi` to raise :class:`NotImplementedError`
+    with a pointer to the two correct scoring paths
+    (:func:`s_lcash_new_level_posterior_means` for new levels;
+    :func:`s_lcash_compute_posteriors` for known ``c_t``).
+
+    Parameters
+    ----------
+    post_mean, post_mean2, post_sd, pi_np, scale, loss, model_param,
+    priors_fitted, priors_fitted_history, marginal_loglik,
+    x_means, x_stds, _arch_meta :
+        See :class:`cebmf_torch.cebnm.lcash.lcash_PosteriorMeanNorm`.
+        For S-LC-ASH, ``_arch_meta`` carries
+        ``{"family": "s_lcash", "n_levels": int, "K": int}`` for the
+        panel fit, or
+        ``{"family": "s_lcash", "single_level": True, "K": int}`` for a
+        cold-start result.
+    level_params : dict or None, optional
+        Per-level scalar parameters fitted by the S-LC-ASH family:
+        ``{"c": Tensor (T,), "p": Tensor (1,)}`` where ``c`` is per
+        level (one entry per level of the categorical covariate) and
+        ``p`` is the shared spike weight.
+    """
+
+    def __init__(
+        self,
+        post_mean,
+        post_mean2,
+        post_sd,
+        pi_np,
+        scale,
+        loss=0,
+        model_param=None,
+        *,
+        priors_fitted=None,
+        priors_fitted_history=None,
+        marginal_loglik: float | None = None,
+        x_means: torch.Tensor | None = None,
+        x_stds: torch.Tensor | None = None,
+        _arch_meta: dict | None = None,
+        level_params: dict | None = None,
+    ):
+        super().__init__(
+            post_mean=post_mean,
+            post_mean2=post_mean2,
+            post_sd=post_sd,
+            pi_np=pi_np,
+            scale=scale,
+            loss=loss,
+            model_param=model_param,
+            priors_fitted=priors_fitted,
+            priors_fitted_history=priors_fitted_history,
+            marginal_loglik=marginal_loglik,
+            x_means=x_means,
+            x_stds=x_stds,
+            _arch_meta=_arch_meta,
+        )
+        self.level_params = level_params
+
+    def predict_pi(
+        self,
+        X: torch.Tensor | None = None,
+        X_cat: torch.Tensor | None = None,
+        device: torch.device | None = None,
+    ) -> torch.Tensor:
+        """Not supported for the S-LC-ASH family.
+
+        S-LC-ASH does not parameterise the prior via a softmax /
+        proportional-odds network of features, so the inherited LC-ASH
+        :meth:`predict_pi` does not apply.
+
+        Two supported scoring paths:
+
+        1. For genes from a NEW level (a level of the categorical
+           covariate that was not present in the panel), call
+           :func:`s_lcash_new_level_posterior_means` to fit a per-level
+           ``c_t`` and obtain posteriors.
+        2. For genes from a level that WAS in the panel (or any scoring
+           with known ``c_t`` and shared ``p``), call
+           :func:`s_lcash_compute_posteriors` directly with the per-level
+           ``log_c``, the shared ``logit_p``, and the shared ``eta`` and
+           ``sigma`` read off ``self.model_param``.
+        """
+        raise NotImplementedError(
+            "predict_pi is not implemented for the S-LC-ASH family. "
+            "Two supported paths to score new data: "
+            "(1) for genes from a NEW level (a level of the categorical "
+            "covariate that was not present in the panel), call "
+            "cebmf_torch.cebnm.s_lcash_new_level_posterior_means(betahat, sebetahat, panel_result) "
+            "to fit a per-level c_t and obtain posteriors via "
+            "s_lcash_compute_posteriors; "
+            "(2) for genes from a level that WAS in the panel (or any "
+            "scoring with known c_t and shared p), call "
+            "cebmf_torch.cebnm.s_lcash.s_lcash_compute_posteriors(...) "
+            "directly with the per-level log_c, the shared logit_p, the "
+            "shared eta and sigma read off panel_result.model_param."
+        )
 
 # ---------------------------------------------------------------------------
 # Module-level defaults (single source of truth).
@@ -521,7 +636,7 @@ def s_lcash_posterior_means(
 
     Returns
     -------
-    cash_PosteriorMeanNorm
+    slcash_PosteriorMeanNorm
         With these fields populated:
 
         * ``post_mean, post_mean2, post_sd`` (N,) per-observation moments.
@@ -534,8 +649,6 @@ def s_lcash_posterior_means(
         * ``level_params = {"c": Tensor (T,), "p": Tensor (1,)}``.
         * ``_arch_meta = {"family": "s_lcash", "n_levels": int, "K": int}``.
     """
-    from cebmf_torch.cebnm.cash_solver import cash_PosteriorMeanNorm
-
     torch.manual_seed(seed)
     device = device or torch.device("cpu")
     betahat = torch.as_tensor(betahat, dtype=torch.float64).to(device)
@@ -665,7 +778,7 @@ def s_lcash_posterior_means(
         "p": torch.sigmoid(model.logit_p).detach().cpu().reshape(1),
     }
 
-    return cash_PosteriorMeanNorm(
+    return slcash_PosteriorMeanNorm(
         post_mean=out["post_mean"].detach().cpu(),
         post_mean2=out["post_mean2"].detach().cpu(),
         post_sd=out["post_sd"].detach().cpu(),
@@ -719,7 +832,7 @@ def s_lcash_new_level_posterior_means(
     ----------
     betahat, sebetahat : Tensor, shape (n_t,)
         New level's data (unbatched).
-    panel_result : cash_PosteriorMeanNorm
+    panel_result : slcash_PosteriorMeanNorm
         Output of :func:`s_lcash_posterior_means`.
     n_epochs : int, optional
         Hard cap on the optimisation budget. Default 200.
@@ -744,11 +857,10 @@ def s_lcash_new_level_posterior_means(
 
     Returns
     -------
-    cash_PosteriorMeanNorm
+    slcash_PosteriorMeanNorm
         Per-observation posteriors plus per-level ``c`` (1-element tensor).
         ``_arch_meta = {"family": "s_lcash", "single_level": True, "K": K}``.
     """
-    from cebmf_torch.cebnm.cash_solver import cash_PosteriorMeanNorm
 
     arch_meta = getattr(panel_result, "_arch_meta", None)
     if arch_meta is None or arch_meta.get("family") != "s_lcash":
@@ -858,7 +970,7 @@ def s_lcash_new_level_posterior_means(
         history_wrapped = [{0: {"loglik_history": loglik_history,
                                   "solver": "s_lcash_cold_start"}}]
 
-    return cash_PosteriorMeanNorm(
+    return slcash_PosteriorMeanNorm(
         post_mean=out["post_mean"].detach().cpu(),
         post_mean2=out["post_mean2"].detach().cpu(),
         post_sd=out["post_sd"].detach().cpu(),
