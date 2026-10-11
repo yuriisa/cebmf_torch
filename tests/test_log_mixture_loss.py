@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from cebmf_torch.cebnm.cash_solver import pen_loglik_loss_from_log_pi, pen_loglik_loss
+from cebmf_torch.cebnm.cash_solver import pen_loglik_loss, pen_loglik_loss_from_log_pi
 
 
 def _cash_loss_reference(pred_pi, marginal_log_lik, penalty, epsilon):
@@ -39,6 +39,16 @@ def test_cash_wrapper_matches_reference_values_and_gradients(dtype, penalty, eps
     torch.testing.assert_close(actual, reference, rtol=8 * eps, atol=8 * eps)
     for got, expected in zip(actual_grad, reference_grad, strict=True):
         torch.testing.assert_close(got, expected, rtol=8 * eps, atol=8 * eps)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_log_weights_preserve_small_components_and_gradients(dtype):
+    log_pi = torch.tensor([[-1000.0, 0.0]], dtype=dtype, requires_grad=True)
+    log_lik = torch.tensor([[1000.0, 0.0]], dtype=dtype)
+    loss = pen_loglik_loss_from_log_pi(log_pi, log_lik, null_coefficient=0.0)
+    gradient = torch.autograd.grad(loss, log_pi)[0]
+    torch.testing.assert_close(loss, -torch.tensor(2.0, dtype=dtype).log())
+    torch.testing.assert_close(gradient, torch.tensor([[-0.5, -0.5]], dtype=dtype))
 
 
 def test_zero_null_coefficient_accepts_negative_infinite_null_log_weight():

@@ -136,7 +136,7 @@ def cash_posterior_means(
     batch_size=128,
     lr=0.001,
     model_param=None,
-    penalty=1.5,
+    penalty=10.0,
     device: torch.device | None = None,
 ):
     """
@@ -168,7 +168,9 @@ def cash_posterior_means(
     model_param : dict, optional
         Pre-trained model parameters to initialize the network.
     penalty : float, optional
-        Penalty for spike probability (default=1.5).
+        Null penalty strength (default=10). For values greater than one,
+        the coefficient per observation is ``(penalty - 1) / n``, where
+        ``n`` is the full training count. ``penalty=1`` omits the null penalty.
     device : torch.device, optional
         Target device for tensors and the model. If ``None``, inherits from
         ``betahat`` when it is already a tensor; otherwise falls back to CUDA
@@ -208,6 +210,7 @@ def cash_posterior_means(
     # ---- dataset / loader (CUDA tensors => num_workers must be 0)
     dataset = DensityRegressionDataset(X_scaled, betahat, sebetahat)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+    null_coefficient = (penalty - 1) / len(dataset) if penalty > 1 else 0.0
 
     # ---- model / optimizer on device
     input_dim = X_scaled.shape[1]
@@ -228,7 +231,8 @@ def cash_posterior_means(
             )
             optimizer_cash.zero_grad()
             outputs = model_cash(inputs)
-            cash_loss = pen_loglik_loss(pred_pi=outputs, marginal_log_lik=batch_loglik, penalty=penalty)
+            log_pi = outputs.clamp_min(1e-10).log()
+            cash_loss = pen_loglik_loss_from_log_pi(log_pi, batch_loglik, null_coefficient)
             cash_loss.backward()
             optimizer_cash.step()
             epoch_loss += cash_loss.item()
