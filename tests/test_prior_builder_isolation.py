@@ -106,3 +106,46 @@ def test_solver_options_survive_another_model(monkeypatch, prior_name):
 
     expected = [(6, {**L_kwargs, "n_epochs": 2}), (4, {**F_kwargs, "n_epochs": 2})]
     assert calls == expected * 2
+
+
+@pytest.mark.parametrize("prior_type", list(learned.LearnedPriorType))
+@pytest.mark.parametrize(
+    ("options", "internal_epoch", "conditional_expected", "other_expected"),
+    [
+        ({}, None, {}, {}),
+        ({}, 10, {"n_epochs": 10}, {"n_epochs": 10}),
+        ({}, 0, {"n_epochs": 0}, {"n_epochs": 0}),
+        ({"n_epochs": None}, None, {"n_epochs": None}, {"n_epochs": None}),
+        ({"n_epochs": None}, 10, {"n_epochs": 10}, {"n_epochs": None}),
+        ({"n_epochs": None}, 0, {"n_epochs": 0}, {"n_epochs": None}),
+        ({"n_epochs": 0}, 10, {"n_epochs": 0}, {"n_epochs": 0}),
+        ({"n_epochs": 7}, 10, {"n_epochs": 7}, {"n_epochs": 7}),
+        ({"n_epochs": 0}, None, {"n_epochs": 0}, {"n_epochs": 0}),
+        ({"n_epochs": 7}, None, {"n_epochs": 7}, {"n_epochs": 7}),
+    ],
+)
+def test_epoch_precedence_is_scoped_to_conditional_solvers(
+    monkeypatch, prior_type, options, internal_epoch, conditional_expected, other_expected
+):
+    calls = []
+
+    def record_solver(X, betahat, sebetahat, *, model_param, device, **kwargs):
+        calls.append(kwargs)
+        pi = torch.full_like(betahat, 0.5)
+        return SimpleNamespace(
+            post_mean=betahat,
+            post_mean2=betahat.square() + sebetahat.square(),
+            loss=betahat.new_zeros(()),
+            model_param=model_param,
+            pi=pi,
+            pi_np=torch.stack((pi, pi), dim=1),
+        )
+
+    monkeypatch.setitem(learned.builder_functions, prior_type, record_solver)
+    builder = learned.LearnedBuilder(prior_type, **options)
+    builder.fit(torch.zeros(2, 1), torch.zeros(2), torch.ones(2), internal_epoch=internal_epoch)
+
+    conditional_types = (learned.LearnedPriorType.LCASH, learned.LearnedPriorType.PO_LCASH)
+    expected = conditional_expected if prior_type in conditional_types else other_expected
+    assert calls == [expected]
+    assert builder.kwargs == options

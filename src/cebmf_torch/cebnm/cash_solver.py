@@ -84,13 +84,6 @@ def pen_loglik_loss_from_log_pi(log_pi, marginal_log_lik, null_coefficient=0.0):
     return -penalized_log_likelihood_value
 
 
-def pen_loglik_loss(pred_pi, marginal_log_lik, penalty=1.5, epsilon=1e-10):
-    """Compute CASH's loss with a probability floor and per-observation null penalty."""
-    log_pi = torch.log(torch.clamp(pred_pi, min=epsilon))
-    null_coefficient = penalty - 1 if penalty > 1 else 0.0
-    return pen_loglik_loss_from_log_pi(log_pi, marginal_log_lik, null_coefficient)
-
-
 class cash_PosteriorMeanNorm:
     def __init__(self, post_mean, post_mean2, post_sd, pi_np, scale, loss=0, model_param=None):
         """

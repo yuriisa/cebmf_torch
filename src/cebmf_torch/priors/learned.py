@@ -127,7 +127,9 @@ class LearnedBuilder(PriorBuilder):
         model_param : Any, optional
             Additional model parameters (default: None).
         internal_epoch : int, optional
-            Number of training epochs for the underlying neural network.
+            Training epochs when ``n_epochs`` is omitted. LC-ASH and PO-LC-ASH
+            also inherit this value when ``n_epochs=None``. Explicit numeric
+            values, including zero, take precedence.
         device : torch.device, optional
             Target device. Forwarded to the underlying cebnm builder so that
             the neural network and its tensors live on the same device as the
@@ -144,15 +146,13 @@ class LearnedBuilder(PriorBuilder):
         ValueError
             If the prior type is unknown or unsupported.
         """
-        # Merge cEBMF-controlled ``internal_epoch`` with user-supplied kwargs.
-        # If the user explicitly set ``n_epochs`` in ``prior_*_kwargs`` (very
-        # common in tests/notebooks), keep that — otherwise fall back to the
-        # cEBMF-level ``internal_epoch``. Done this way to avoid the
-        # ``TypeError: got multiple values for keyword argument 'n_epochs'``
-        # collision that the previous ``n_epochs=internal_epoch, **self.kwargs``
-        # produced whenever the user passed ``n_epochs`` themselves.
+        # Numeric solver settings override the outer epoch budget. Only LC-ASH
+        # and PO-LC-ASH treat an explicit None as an unspecified budget.
         call_kwargs = dict(self.kwargs)
-        if "n_epochs" not in call_kwargs and internal_epoch is not None:
+        inherit_epochs = "n_epochs" not in call_kwargs or (
+            self.type in (LearnedPriorType.LCASH, LearnedPriorType.PO_LCASH) and call_kwargs["n_epochs"] is None
+        )
+        if inherit_epochs and internal_epoch is not None:
             call_kwargs["n_epochs"] = internal_epoch
         # device is internal plumbing; user-passed values would be overridden anyway.
         call_kwargs.pop("device", None)

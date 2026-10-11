@@ -4,11 +4,8 @@ Asserts that ``result.loss == -log p(y | fitted prior)`` (i.e. the negative
 full-data marginal log-likelihood, no penalty), as required by the cebmf
 consumer at ``cebmf/cebmf.py:299``: ``self.kl_l[k] = (-resL.loss) - nm_ll_L``.
 
-Before the fix the returned ``loss`` was ``final_epoch_loss`` from training
-(a sum of per-batch ``pen_loglik_loss`` values on the last epoch), which is
-not on the marginal-log-lik scale once ``penalty > 1`` and clamps the inner
-density at ``1e-10``. After the fix it is computed via a single full-batch
-``logsumexp`` over the saved per-observation pi values.
+The reported loss uses a full-data logsumexp calculation with the fitted
+mixture weights and excludes the training penalty.
 """
 
 import math
@@ -69,7 +66,7 @@ def test_lcash_loss_equals_negative_marginal_loglik_penalty1():
     )
     proper_ll = _proper_marginal_loglik(x, s, res.scale, res.pi_np)
     expected_loss = -proper_ll
-    # Tight tolerance: the post-fix loss is computed from exactly the same
+    # Tight tolerance: the loss is computed from exactly the same
     # tensor that the test recomputes here.
     assert abs(res.loss - expected_loss) < 1e-3, f"LC-ASH loss = {res.loss}, expected -marginal_ll = {expected_loss}"
 

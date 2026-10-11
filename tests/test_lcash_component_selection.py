@@ -51,7 +51,7 @@ def test_weight_equal_to_threshold_is_removed(solver, controlled_ash):
 @pytest.mark.parametrize("solver", SOLVERS)
 @pytest.mark.parametrize(
     "weights,threshold,count",
-    [([0.4, 0.3, 0.3], 0.5, 0), ([1.0, 5e-9, 5e-9], 1e-6, 1), ([5e-9, 1.0, 5e-9], 1e-6, 1)],
+    [([0.4, 0.3, 0.3], 0.5, 0), ([5e-9, 1.0, 5e-9], 1e-6, 1)],
 )
 def test_insufficient_components_raise_without_fallback(solver, weights, threshold, count, controlled_ash):
     _, fitted_weights = controlled_ash

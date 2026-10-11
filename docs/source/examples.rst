@@ -203,20 +203,35 @@ zero-centred normal mixture prior from covariates. PO-LC-ASH uses
 proportional odds regression. The component grid is the ordered set of
 mixture standard deviations; zero represents a point mass at zero (the spike).
 
-For a fresh fit, ``ash_init=True`` first fits adaptive shrinkage (ASH)
-without covariates. It retains components with weight above
-``ash_threshold`` (default ``1e-6``) and uses their weights to initialize
-the regression model. ``ash_init=False`` uses the full automatically
-selected component grid. The component standard deviations remain fixed
-during regression fitting.
+For a fresh fit, ``ash_init=True`` fits adaptive shrinkage (ASH) without
+covariates, using its default penalty of 10. It retains weights above
+``ash_threshold``. The default ``None`` resolves to ``min(1e-6, 0.5/n)``,
+where ``n`` is the training observation count. A numeric ``ash_threshold``
+sets the cutoff directly.
+The initial covariate coefficients are zero, so the initial conditional
+mixture equals the retained, normalized ASH mixture.
 
-Selection raises ``ValueError`` if fewer than two components remain or
-the spike is removed. Inspect the ASH weights and consider lowering
-``ash_threshold``; ``0.0`` retains all positive returned weights. To inspect
-the initializer weights, call
+``ash_init=False`` uses the full automatically selected grid. Component
+scales stay fixed during training and warm starts. Selection raises
+``ValueError`` if the spike or every component is removed. A single retained
+spike returns its exact posterior without optimization.
+
+To inspect the initializer, call
 ``ash(betahat, se, optimizer="lbfgs", zero_threshold=0.0)`` with the same
-``mult``. The ASH initializer uses a spike penalty of ``10.0``. The
-conditional solver's ``penalty`` controls subsequent regression fitting.
+``mult`` and float32 inputs. The caller's conditional penalty does not change
+this ASH(10) fit. With ``ash_threshold=0``, ASH's return floor can
+retain components whose optimizer weights were zero.
+
+The conditional ``penalty`` defaults to 10 and uses the coefficient
+``(penalty-1)/n`` in each minibatch. At zero slopes this equals ASH's null
+penalty of the same strength. A value of 1 omits the null term.
+
+Continued training uses the supplied penalty and the number of supplied
+observations. Saved-state prediction with ``n_epochs=0`` applies no penalty.
+
+Training uses direct log probabilities and rejects non-finite model states,
+losses, and gradients. Returned ``loss`` is the negative unpenalized
+marginal log likelihood required by cEBMF.
 
 The returned ``model_param`` contains the selected component grid, fitted
 regression parameters, covariate means and standard deviations used for
@@ -234,9 +249,10 @@ Covariate columns must retain their meaning, order and units. Missing
 entries and columns with zero standard deviation in the original fit are
 set to zero after standardization.
 
-Each call starts a new Adam optimizer. Use ``n_epochs=0`` to calculate
-posterior summaries with the saved prior. To select a new grid or estimate
-new covariate statistics, start a fresh fit without ``model_param``.
+Each training call with more than one component starts a new Adam optimizer.
+Use ``n_epochs=0`` to calculate posterior summaries with the saved prior.
+To select a new grid or estimate new covariate statistics, start a fresh fit
+without ``model_param``.
 Pass the complete returned dictionary as ``model_param``;
 ``model_param["state_dict"]`` contains only the regression parameters.
 
@@ -263,6 +279,9 @@ epochs per call. ``po_lcash_posterior_means`` supports the same calling pattern.
     torch.testing.assert_close(updated.scale, first.scale)
 
 Within cEBMF, fitted state is passed between successive factor updates.
+For LC-ASH and PO-LC-ASH, omitted or ``None`` inner ``n_epochs`` inherits
+``internal_epoch``. An explicit zero or positive value overrides it.
+The standalone default is 200 epochs.
 If factor pruning changes the number of covariate columns, the next update
 raises ``ValueError`` because the saved state requires the original column count.
 
