@@ -18,7 +18,7 @@ from cebmf_torch.cebnm.cash_solver import (
     cash_PosteriorMeanNorm,
     pen_loglik_loss,
 )
-from cebmf_torch.ebnm.ash import PriorType, ash
+from cebmf_torch.ebnm.ash import AshConfig, PriorType, ash
 from cebmf_torch.utils.distribution_operation import get_data_loglik_normal_torch
 from cebmf_torch.utils.mixture import autoselect_scales_mix_norm
 
@@ -395,7 +395,7 @@ def _train_model(
         for start in range(0, n, batch_size):
             idx = perm[start : start + batch_size]
             pi_pred = model(X_scaled[idx])
-            loss = pen_loglik_loss(pi_pred, logL_all[idx], penalty=penalty)
+            loss = pen_loglik_loss(pi_pred, logL_all[idx], penalty=1 + (penalty - 1) / n)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -478,7 +478,7 @@ def _fit_lcash(
     batch_size: int = 512,
     lr: float = 1e-3,
     weight_decay: float = 1e-3,
-    penalty: float = 1.5,
+    penalty: float = AshConfig.penalty,
     mult: float = 1.4142135623730951,
     ash_init: bool = True,
     ash_threshold: float = 1e-6,
@@ -602,7 +602,7 @@ def lcash_posterior_means(
     batch_size: int = 512,
     lr: float = 1e-3,
     weight_decay: float = 1e-3,
-    penalty: float = 1.5,
+    penalty: float = AshConfig.penalty,
     mult: float = 1.4142135623730951,
     ash_init: bool = True,
     ash_threshold: float = 1e-6,
@@ -720,7 +720,7 @@ def po_lcash_posterior_means(
     batch_size: int = 512,
     lr: float = 1e-3,
     weight_decay: float = 1e-3,
-    penalty: float = 1.5,
+    penalty: float = AshConfig.penalty,
     mult: float = 1.4142135623730951,
     ash_init: bool = True,
     ash_threshold: float = 1e-6,
