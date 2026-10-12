@@ -1,5 +1,6 @@
 from collections.abc import Callable
 from enum import StrEnum, auto
+from inspect import signature
 from typing import Any
 
 import torch
@@ -79,7 +80,7 @@ class LearnedBuilder(PriorBuilder):
             Additional keyword arguments specific to the prior type.
         """
         self.type = type
-        self.kwargs = kwargs
+        self.set_kwargs(**kwargs)
 
     def set_kwargs(self, **new_kwargs: Any) -> None:
         """
@@ -90,6 +91,13 @@ class LearnedBuilder(PriorBuilder):
         **new_kwargs : Any
             New keyword arguments to set, replacing the old ones.
         """
+        if self.type in (LearnedPriorType.LCASH, LearnedPriorType.PO_LCASH):
+            try:
+                signature(builder_functions[self.type]).bind_partial(**new_kwargs)
+            except TypeError as error:
+                raise TypeError(
+                    f"Invalid {self.type} options: {error}. Use max_iter to set the L-BFGS iteration budget."
+                ) from error
         self.kwargs = new_kwargs
 
     @property

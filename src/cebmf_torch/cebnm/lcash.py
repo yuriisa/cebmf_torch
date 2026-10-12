@@ -32,7 +32,7 @@ _MODEL_PARAM_VERSION = 1
 def _require_finite(value: torch.Tensor, name: str) -> None:
     """Raise FloatingPointError if a tensor contains non-finite values."""
     if not torch.isfinite(value).all():
-        raise FloatingPointError(f"{name} must be finite; the conditional fit is invalid.")
+        raise FloatingPointError(f"{name} must be finite.")
 
 
 def _log_gap_mass(log_gap: torch.Tensor) -> torch.Tensor:
@@ -85,7 +85,7 @@ class LcashNet(nn.Module):
             dtype = log_pi_init.dtype if dtype is None else dtype
         # Allocate without random initialization, then set the ASH handoff.
         self.linear = nn.Linear(input_dim, num_classes, device="meta", dtype=dtype)
-        self.linear.to_empty(device="cpu" if device is None else device)
+        self.linear.to_empty(device=torch.empty(0).device if device is None else device)
         with torch.no_grad():
             self.linear.weight.zero_()
             self.linear.bias.zero_()
@@ -374,44 +374,48 @@ def _select_grid(
 def _train_model(
     model: nn.Module,
     X_scaled: torch.Tensor,
-    betahat: torch.Tensor,
-    sebetahat: torch.Tensor,
-    scale: torch.Tensor,
+    data_loglik: torch.Tensor,
     max_iter: int,
     penalty: float,
     verbose: bool,
     label: str,
+    coefficient_prior_scale: float | None = 1.0,
+    coefficient_prior_df: float = 5.0,
 ) -> None:
-    """Fit the full-data mean objective, with no coefficient penalty.
+    """Fit the mean objective with nullweight and optional Student-t slope priors.
 
-    A failed line search raises instead of returning an invalid fit.
+    A non-finite objective or gradient raises instead of returning a fit.
     Each call uses fresh curvature history for its normal-means problem.
     """
     model.train()
-    with torch.no_grad():
-        logL_all = get_data_loglik_normal_torch(
-            betahat=betahat,
-            sebetahat=sebetahat,
-            location=torch.zeros_like(scale),
-            scale=scale,
-        )
-        _require_finite(logL_all, "Conditional component log likelihoods")
     n = X_scaled.shape[0]
     params = list(model.parameters())
+    coefficient_prior = None
+    if coefficient_prior_scale is not None:
+        # The public entry point validates these scalars once. Avoid repeated
+        # distribution support checks inside the L-BFGS closure.
+        coefficient_prior = torch.distributions.StudentT(
+            X_scaled.new_tensor(coefficient_prior_df), scale=coefficient_prior_scale, validate_args=False
+        )
     optimizer = torch.optim.LBFGS(
         params,
         max_iter=max_iter,
         tolerance_grad=1e-7,
-        tolerance_change=1e-12,
+        tolerance_change=1e-15,
         line_search_fn="strong_wolfe",
     )
 
     def closure():
         optimizer.zero_grad(set_to_none=True)
-        loss = pen_loglik_loss_from_log_pi(model.log_probs(X_scaled), logL_all, null_coefficient=(penalty - 1) / n) / n
-        _require_finite(loss, "Conditional objective")
+        loss = pen_loglik_loss_from_log_pi(model.log_probs(X_scaled), data_loglik, null_coefficient=(penalty - 1) / n)
+        if coefficient_prior is not None:
+            # LC slopes are log-odds contrasts against the null component.
+            slopes = model.linear.weight[1:] - model.linear.weight[:1] if isinstance(model, LcashNet) else model.w
+            loss = loss - coefficient_prior.log_prob(slopes).sum()
+        loss = loss / n
+        _require_finite(loss, "Conditional optimization objective")
         loss.backward()
-        _require_finite(torch.cat([p.grad.reshape(-1) for p in params]), "Conditional gradient")
+        _require_finite(torch.cat([p.grad.reshape(-1) for p in params]), "Conditional optimization gradient")
         return loss
 
     initial = [p.detach().clone() for p in params]
@@ -419,10 +423,14 @@ def _train_model(
         optimizer.step(closure)
         # LBFGS.step returns its initial loss; evaluate the actual endpoint.
         final_loss = closure().detach().item()
-    except (FloatingPointError, RuntimeError):
+    except (FloatingPointError, RuntimeError) as error:
         with torch.no_grad():
             for parameter, value in zip(params, initial, strict=True):
                 parameter.copy_(value)
+        if isinstance(error, FloatingPointError):
+            raise FloatingPointError(
+                f"{label} L-BFGS encountered a non-finite evaluation; no fit was returned. {error}"
+            ) from error
         raise
     grad_max = max(p.grad.abs().max().item() for p in params if p.numel())
     state = optimizer.state[params[0]]
@@ -453,6 +461,7 @@ def _compute_posteriors(
     betahat: torch.Tensor,
     sebetahat: torch.Tensor,
     scale: torch.Tensor,
+    data_loglik: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]:
     """Vectorised posterior computation with per-observation pi.
 
@@ -476,10 +485,6 @@ def _compute_posteriors(
         _require_finite(log_pi_all, "Conditional log probabilities")
         all_pi_values = log_pi_all.exp()  # (G, K)
 
-        data_loglik = get_data_loglik_normal_torch(
-            betahat=betahat, sebetahat=sebetahat, location=loc, scale=scale
-        )  # (G, K)
-        _require_finite(data_loglik, "Conditional component log likelihoods")
         loglik = torch.logsumexp(data_loglik + log_pi_all, dim=1).sum()
         _require_finite(loglik, "Conditional marginal log likelihood")
         posterior = posterior_mean_norm(betahat, sebetahat, log_pi_all, data_loglik, scale, location=loc)
@@ -498,12 +503,14 @@ def _fit_lcash(
     *,
     max_iter: int | None = None,
     penalty: float = AshConfig.penalty,
+    coefficient_prior_scale: float | None = 1.0,
+    coefficient_prior_df: float = 5.0,
     mult: float = 1.4142135623730951,
     ash_init: bool = True,
     ash_threshold: float | None = None,
     model_param: dict | None = None,
     device: torch.device | None = None,
-    verbose: bool = True,
+    verbose: bool = False,
 ) -> cash_PosteriorMeanNorm:
     """Shared implementation for both softmax and proportional odds LC-ASH.
 
@@ -542,6 +549,13 @@ def _fit_lcash(
         raise ValueError("max_iter must be a nonnegative integer or None.")
     if max_iter > 0 and (not math.isfinite(penalty) or penalty < 1):
         raise ValueError("penalty must be finite and at least one.")
+    if max_iter > 0 and coefficient_prior_scale is not None:
+        for name, value in (
+            ("coefficient_prior_scale", coefficient_prior_scale),
+            ("coefficient_prior_df", coefficient_prior_df),
+        ):
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be finite and positive.")
     if model_param is None:
         feature_mean, feature_sd = _feature_statistics(X)
         scale, log_pi_init = _select_grid(betahat, sebetahat, mult, ash_init, ash_threshold, device)
@@ -555,8 +569,21 @@ def _fit_lcash(
     if model_param is not None:
         model.load_state_dict(model_param["state_dict"])
 
+    with torch.no_grad():
+        data_loglik = get_data_loglik_normal_torch(betahat, sebetahat, torch.zeros_like(scale), scale)
+        _require_finite(data_loglik, "Conditional component log likelihoods")
     if K > 1 and max_iter > 0:
-        _train_model(model, X_scaled, betahat, sebetahat, scale, max_iter, penalty, verbose, label)
+        _train_model(
+            model,
+            X_scaled,
+            data_loglik,
+            max_iter,
+            penalty,
+            verbose,
+            label,
+            coefficient_prior_scale,
+            coefficient_prior_df,
+        )
 
     post_mean, post_mean2, post_sd, all_pi_values, marginal_loglik = _compute_posteriors(
         model,
@@ -564,6 +591,7 @@ def _fit_lcash(
         betahat,
         sebetahat,
         scale,
+        data_loglik,
     )
 
     fitted_state = {
@@ -584,6 +612,8 @@ def _fit_lcash(
             ("scale", scale),
         )
     }
+    # Separate float32 rounding must preserve E[theta^2] >= E[theta]^2.
+    output["post_mean2"] = torch.maximum(output["post_mean2"], output["post_mean"].square())
     for name, value in output.items():
         _require_finite(value, f"Returned conditional {name}")
     _validate_grid(output["scale"])
@@ -603,12 +633,14 @@ def lcash_posterior_means(
     *,
     max_iter: int | None = None,
     penalty: float = AshConfig.penalty,
+    coefficient_prior_scale: float | None = 1.0,
+    coefficient_prior_df: float = 5.0,
     mult: float = 1.4142135623730951,
     ash_init: bool = True,
     ash_threshold: float | None = None,
     model_param: dict | None = None,
     device: torch.device | None = None,
-    verbose: bool = True,
+    verbose: bool = False,
 ) -> cash_PosteriorMeanNorm:
     """LC-ASH: linear covariate-modulated mixture weights.
 
@@ -633,13 +665,24 @@ def lcash_posterior_means(
         Maximum full-batch L-BFGS iterations. None uses 500 standalone or
         twice internal_epoch inside cEBMF. An explicit integer, including
         zero, overrides this budget. The mean objective includes the null
-        penalty but no coefficient penalty. Each iteration can evaluate
+        penalty and the coefficient prior. Each iteration can evaluate
         the objective more than once. A budget limit does not imply convergence.
     penalty : float
         ASH-style nullweight, finite and at least one. The coefficient in
         conditional training is (penalty - 1) / n for the full training count.
         Default 10.0; 1.0 omits the null penalty. The ASH initializer always
         uses 10.0.
+    coefficient_prior_scale : float or None
+        Scale of a zero-centred Student-t prior on each component's
+        standardized covariate slopes relative to the null component.
+        Intercepts are not penalized. Default 1.0; None disables the prior.
+        A supplied scale must be finite and positive. Scale is not the
+        prior's standard deviation. The summed negative log density from
+        ``torch.distributions.StudentT`` is divided by the training count
+        in the mean objective.
+    coefficient_prior_df : float
+        Degrees of freedom of the coefficient prior. Default 5.0.
+        Must be finite and positive when the prior is enabled.
     mult : float
         Multiplicative step between mixture grid SDs for a fresh fit.
         Smaller values give a finer grid. Default sqrt(2).
@@ -671,7 +714,9 @@ def lcash_posterior_means(
         contains only the regression coefficients and intercepts.
         Each training call creates a new L-BFGS optimizer unless only the
         spike remains. Use ``max_iter=0`` to calculate posterior summaries
-        with the saved prior, without evaluating the penalty.
+        with the saved prior, without evaluating either penalty.
+        Training settings are not stored; pass the same nullweight and
+        coefficient-prior settings to continue the same objective.
     device : torch.device or None
         Compute device. Inherited from ``betahat`` when it is a tensor;
         otherwise defaults to CUDA if available, then CPU. Fitting and saved
@@ -679,13 +724,16 @@ def lcash_posterior_means(
         Posterior summaries, probabilities and scales return as float32 on
         the requested device; saved state remains on the fitting device.
     verbose : bool
-        If True (default), print the final objective, gradient and iteration counts.
+        If True, print the final objective, gradient and iteration counts.
+        Default False. Convergence warnings do not depend on this option.
 
     Returns
     -------
     cash_PosteriorMeanNorm
         Container with post_mean, post_mean2, post_sd, pi_np (G, K),
         scale (K,), loss, and model_param (fitted state for warm-starting).
+        ``loss`` is the summed negative marginal log likelihood without
+        either penalty.
 
     Raises
     ------
@@ -707,6 +755,8 @@ def lcash_posterior_means(
         label="LC-ASH",
         max_iter=max_iter,
         penalty=penalty,
+        coefficient_prior_scale=coefficient_prior_scale,
+        coefficient_prior_df=coefficient_prior_df,
         mult=mult,
         ash_init=ash_init,
         ash_threshold=ash_threshold,
@@ -723,12 +773,14 @@ def po_lcash_posterior_means(
     *,
     max_iter: int | None = None,
     penalty: float = AshConfig.penalty,
+    coefficient_prior_scale: float | None = 1.0,
+    coefficient_prior_df: float = 5.0,
     mult: float = 1.4142135623730951,
     ash_init: bool = True,
     ash_threshold: float | None = None,
     model_param: dict | None = None,
     device: torch.device | None = None,
-    verbose: bool = True,
+    verbose: bool = False,
 ) -> cash_PosteriorMeanNorm:
     """Proportional odds LC-ASH: ordered logistic covariate-modulated weights.
 
@@ -738,6 +790,12 @@ def po_lcash_posterior_means(
     weights via cumulative logistic probabilities. The model stores
     F + K - 1 parameters. Softmax LC-ASH stores K * F coefficients
     and K intercepts.
+
+    The coefficient prior is Student-t with zero location, scale
+    ``coefficient_prior_scale`` (default 1.0), and degrees of freedom
+    ``coefficient_prior_df`` (default 5.0). It applies to the shared
+    standardized slope vector w. Cut-points are not penalized.
+    Set ``coefficient_prior_scale=None`` to disable it.
 
     On a fresh fit with ``ash_init=True``, select components from ASH
     at penalty 10 and initialise cut-points from retained, normalized
@@ -782,6 +840,8 @@ def po_lcash_posterior_means(
         label="PO-LC-ASH",
         max_iter=max_iter,
         penalty=penalty,
+        coefficient_prior_scale=coefficient_prior_scale,
+        coefficient_prior_df=coefficient_prior_df,
         mult=mult,
         ash_init=ash_init,
         ash_threshold=ash_threshold,

@@ -92,7 +92,8 @@ For LC-ASH and PO-LC-ASH, ``penalty=1`` disables the extra spike penalty;
 larger values encourage the fitted prior to assign more mass to zero. The
 example therefore uses different sparsity penalties for L and F. These values
 illustrate separate configuration, rather than recommended tuning settings.
-The covariate coefficients have no additional penalty.
+A separate Student-t prior regularizes the standardized covariate coefficients.
+Its scale and degrees of freedom can also be set independently for L and F.
 
 Omitting a side's options adds no per-side overrides; learned priors still
 receive cEBMF's epoch and device settings. Constructing another cEBMF model
@@ -228,19 +229,42 @@ penalty of the same strength. A value of 1 omits the null term.
 Continued training uses the supplied penalty and the number of supplied
 observations. Saved-state prediction with ``max_iter=0`` applies no penalty.
 
-Training uses full-batch L-BFGS in float64 with direct log probabilities.
-It rejects non-finite model states, losses, and gradients. There is no
-coefficient penalty. Returned ``loss`` is the negative unpenalized
-marginal log likelihood required by cEBMF.
+Training uses native PyTorch ``torch.optim.LBFGS`` with full batches,
+float64 arithmetic and direct log probabilities. Component log likelihoods
+are computed once per fit and reused for optimization and posterior summaries.
+
+The standardized covariate coefficients have independent Student-t priors,
+evaluated with native ``torch.distributions.StudentT``. The defaults are
+``coefficient_prior_scale=1.0`` and ``coefficient_prior_df=5.0``, with location
+zero. Both parameters must be finite and positive for training. Scale is the
+distribution's scale parameter, not its standard deviation. Set ``coefficient_prior_scale=None``
+to disable this prior.
+
+For LC-ASH, the prior applies to each non-null component's slope minus the
+null component's slope. These contrasts describe component-versus-null log odds;
+adding the same slope to all components does not change the model or its prior.
+For PO-LC-ASH, the prior applies to the shared slope vector. With two components,
+these are the same coefficient interpretation. Intercepts and cut-points are
+not penalized. Each coefficient refers to a one-standard-deviation covariate
+change, using the saved training means and standard deviations.
+
+The summed negative log prior is divided by ``n`` and added to the mean
+training objective. It regularizes covariate effects separately from the
+null penalty. Returned ``loss`` excludes both prior terms: it is the summed
+negative marginal log likelihood required by cEBMF.
 
 The solver raises ``FloatingPointError`` if an optimization trial has a
-non-finite loss or gradient. A finite fit that stops above the gradient
-tolerance emits ``RuntimeWarning``; the warning distinguishes an exhausted
+non-finite loss or gradient. It restores the initial parameters before raising;
+a failed trial does not establish that no finite optimum exists. A finite fit
+that stops above the gradient tolerance emits ``RuntimeWarning``; the warning distinguishes an exhausted
 budget from a small step or objective change. A warned fit can still change
 materially with further optimization. To continue with fresh optimizer history,
-pass its complete ``model_param`` with the same data and penalty. Inspect the
+pass its complete ``model_param`` with the same data, ``penalty``,
+``coefficient_prior_scale`` and ``coefficient_prior_df``. Prior settings belong
+to the training call and are not stored in ``model_param``. Inspect the
 final diagnostics and posterior changes; a larger budget alone does not ensure
-convergence.
+convergence. Fits are quiet by default; ``verbose=True`` prints the final
+iteration count, evaluation count, mean objective and maximum gradient.
 
 Fitting and saved state use float64. MPS fits run on CPU because MPS does
 not support float64. Returned posterior summaries, weights and scales use

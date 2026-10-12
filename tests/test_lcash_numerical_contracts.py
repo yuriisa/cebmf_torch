@@ -46,7 +46,12 @@ def test_po_rejects_cumulative_cutpoint_overflow_with_finite_gaps(dtype):
     x = torch.zeros(2, dtype=dtype)
     with pytest.raises(FloatingPointError, match="log probabilities.*finite"):
         lcash._compute_posteriors(
-            model, x[:, None], x, torch.ones_like(x), torch.tensor([0.0, 1.0, 2.0, 4.0], dtype=dtype)
+            model,
+            x[:, None],
+            x,
+            torch.ones_like(x),
+            torch.tensor([0.0, 1.0, 2.0, 4.0], dtype=dtype),
+            torch.zeros(2, 4, dtype=dtype),
         )
 
 
@@ -158,3 +163,17 @@ def test_output_cast_must_preserve_distinct_component_scales(solver, monkeypatch
     standard_error = torch.full((2,), 1e-50, dtype=torch.float64)
     with pytest.raises(ValueError, match="strictly increasing"):
         solver(features, observed, standard_error, model_param=state, max_iter=0, verbose=False)
+
+
+@pytest.mark.parametrize("solver", [lcash_posterior_means, po_lcash_posterior_means])
+def test_float32_moments_imply_nonnegative_variance(solver, monkeypatch):
+    monkeypatch.setattr(
+        lcash,
+        "ash",
+        lambda *args, **kwargs: SimpleNamespace(pi=torch.tensor([0.5, 0.5]), scale=torch.tensor([0.0, 1.0])),
+    )
+    observed = torch.tensor([1.0008100271224976])
+    result = solver(torch.zeros(1, 1), observed, torch.full_like(observed, 1e-4), max_iter=0)
+    assert torch.all(result.post_mean2 >= result.post_mean.square())
+    # The separately computed SD retains uncertainty too small for float32 moments.
+    torch.testing.assert_close(result.post_sd, torch.full_like(observed, 1e-4))
