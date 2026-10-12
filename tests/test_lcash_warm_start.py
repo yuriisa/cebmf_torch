@@ -17,7 +17,7 @@ def fit_inputs():
     betahat = torch.linspace(-3, 3, 32)
     X = torch.stack((betahat, betahat.square()), dim=1)
     se = torch.ones(32)
-    options = {"n_epochs": 0, "ash_init": False, "verbose": False, "device": torch.device("cpu")}
+    options = {"max_iter": 0, "ash_init": False, "verbose": False, "device": torch.device("cpu")}
     return X, betahat, se, options
 
 
@@ -38,9 +38,9 @@ def no_grid_selection(*args, **kwargs):
 
 @pytest.mark.parametrize("solver", SOLVERS)
 @pytest.mark.parametrize("ash_init", [False, True])
-def test_zero_epoch_warm_start_restores_full_fit(solver, ash_init, fit_inputs, monkeypatch):
+def test_zero_iteration_warm_start_restores_full_fit(solver, ash_init, fit_inputs, monkeypatch):
     X, betahat, se, options = fit_inputs
-    trained = solver(X, betahat, se, **(options | {"n_epochs": 2, "ash_init": ash_init}))
+    trained = solver(X, betahat, se, **(options | {"max_iter": 2, "ash_init": ash_init}))
     saved = copy.deepcopy(trained.model_param)
     monkeypatch.setattr(lcash_module, "_select_grid", no_grid_selection)
     loaded = solver(
@@ -90,7 +90,7 @@ def test_new_rows_use_training_feature_transform(solver, model_class, fit_inputs
     X, betahat, se, options = fit_inputs
     X = torch.cat((X, torch.ones(32, 1), torch.full((32, 1), float("nan"))), dim=1)
     X[:3, 0] = float("nan")
-    first = solver(X, betahat, se, **(options | {"n_epochs": 2}))
+    first = solver(X, betahat, se, **(options | {"max_iter": 2}))
     state = first.model_param
     new_X = X[:7].nan_to_num() + 4
     new_X[0, 0] = float("nan")
@@ -142,7 +142,7 @@ def test_further_training_does_not_mutate_previous_state(solver, fit_inputs):
     X, betahat, se, options = fit_inputs
     first = solver(X, betahat, se, **options)
     snapshot = copy.deepcopy(first.model_param)
-    updated = solver(X, betahat, se, model_param=first.model_param, **(options | {"n_epochs": 2}))
+    updated = solver(X, betahat, se, model_param=first.model_param, **(options | {"max_iter": 2}))
     assert_same_state(first.model_param, snapshot)
     assert any(
         not torch.equal(value, updated.model_param["state_dict"][key])

@@ -92,8 +92,7 @@ For LC-ASH and PO-LC-ASH, ``penalty=1`` disables the extra spike penalty;
 larger values encourage the fitted prior to assign more mass to zero. The
 example therefore uses different sparsity penalties for L and F. These values
 illustrate separate configuration, rather than recommended tuning settings.
-The separate ``weight_decay`` option regularizes the coefficients mapping
-covariates to mixture weights.
+The covariate coefficients have no additional penalty.
 
 Omitting a side's options adds no per-side overrides; learned priors still
 receive cEBMF's epoch and device settings. Constructing another cEBMF model
@@ -218,20 +217,34 @@ spike returns its exact posterior without optimization.
 
 To inspect the initializer, call
 ``ash(betahat, se, optimizer="lbfgs", zero_threshold=0.0)`` with the same
-``mult`` and float32 inputs. The caller's conditional penalty does not change
+``mult`` and float64 inputs. The caller's conditional penalty does not change
 this ASH(10) fit. With ``ash_threshold=0``, ASH's return floor can
 retain components whose optimizer weights were zero.
 
 The conditional ``penalty`` defaults to 10 and uses the coefficient
-``(penalty-1)/n`` in each minibatch. At zero slopes this equals ASH's null
+``(penalty-1)/n`` in the full-data objective. At zero slopes this equals ASH's null
 penalty of the same strength. A value of 1 omits the null term.
 
 Continued training uses the supplied penalty and the number of supplied
-observations. Saved-state prediction with ``n_epochs=0`` applies no penalty.
+observations. Saved-state prediction with ``max_iter=0`` applies no penalty.
 
-Training uses direct log probabilities and rejects non-finite model states,
-losses, and gradients. Returned ``loss`` is the negative unpenalized
+Training uses full-batch L-BFGS in float64 with direct log probabilities.
+It rejects non-finite model states, losses, and gradients. There is no
+coefficient penalty. Returned ``loss`` is the negative unpenalized
 marginal log likelihood required by cEBMF.
+
+The solver raises ``FloatingPointError`` if an optimization trial has a
+non-finite loss or gradient. A finite fit that stops above the gradient
+tolerance emits ``RuntimeWarning``; the warning distinguishes an exhausted
+budget from a small step or objective change. A warned fit can still change
+materially with further optimization. To continue with fresh optimizer history,
+pass its complete ``model_param`` with the same data and penalty. Inspect the
+final diagnostics and posterior changes; a larger budget alone does not ensure
+convergence.
+
+Fitting and saved state use float64. MPS fits run on CPU because MPS does
+not support float64. Returned posterior summaries, weights and scales use
+float32 on the requested device.
 
 The returned ``model_param`` contains the selected component grid, fitted
 regression parameters, covariate means and standard deviations used for
@@ -249,15 +262,15 @@ Covariate columns must retain their meaning, order and units. Missing
 entries and columns with zero standard deviation in the original fit are
 set to zero after standardization.
 
-Each training call with more than one component starts a new Adam optimizer.
-Use ``n_epochs=0`` to calculate posterior summaries with the saved prior.
+Each training call with more than one component starts a new L-BFGS optimizer.
+Use ``max_iter=0`` to calculate posterior summaries with the saved prior.
 To select a new grid or estimate new covariate statistics, start a fresh fit
 without ``model_param``.
 Pass the complete returned dictionary as ``model_param``;
 ``model_param["state_dict"]`` contains only the regression parameters.
 
-The example below continues fitting from saved state, using five training
-epochs per call. ``po_lcash_posterior_means`` supports the same calling pattern.
+The example below continues fitting from saved state, using up to 100 L-BFGS
+iterations per call. ``po_lcash_posterior_means`` supports the same calling pattern.
 
 .. code-block:: python
 
@@ -270,18 +283,19 @@ epochs per call. ``po_lcash_posterior_means`` supports the same calling pattern.
     se = torch.full_like(betahat, 0.2)
 
     first = lcash_posterior_means(
-        X, betahat, se, n_epochs=5, device="cpu", verbose=False
+        X, betahat, se, max_iter=100, device="cpu", verbose=False
     )
     updated = lcash_posterior_means(
         X, betahat + 0.05, se, model_param=first.model_param,
-        n_epochs=5, device="cpu", verbose=False
+        max_iter=100, device="cpu", verbose=False
     )
     torch.testing.assert_close(updated.scale, first.scale)
 
 Within cEBMF, fitted state is passed between successive factor updates.
-For LC-ASH and PO-LC-ASH, omitted or ``None`` inner ``n_epochs`` inherits
-``internal_epoch``. An explicit zero or positive value overrides it.
-The standalone default is 200 epochs.
+For LC-ASH and PO-LC-ASH, omitted or ``None`` inner ``max_iter`` uses
+``2 * internal_epoch``. An explicit zero or positive value overrides it.
+The standalone default is 500 iterations. Iteration counts are upper limits;
+L-BFGS can stop earlier when it meets a convergence criterion.
 If factor pruning changes the number of covariate columns, the next update
 raises ``ValueError`` because the saved state requires the original column count.
 

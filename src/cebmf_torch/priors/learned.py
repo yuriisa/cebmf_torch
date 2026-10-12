@@ -128,8 +128,9 @@ class LearnedBuilder(PriorBuilder):
             Additional model parameters (default: None).
         internal_epoch : int, optional
             Training epochs when ``n_epochs`` is omitted. LC-ASH and PO-LC-ASH
-            also inherit this value when ``n_epochs=None``. Explicit numeric
-            values, including zero, take precedence.
+            use twice this value as their L-BFGS iteration budget when
+            ``max_iter`` is omitted or None. Explicit numeric solver budgets,
+            including zero, take precedence.
         device : torch.device, optional
             Target device. Forwarded to the underlying cebnm builder so that
             the neural network and its tensors live on the same device as the
@@ -146,13 +147,11 @@ class LearnedBuilder(PriorBuilder):
         ValueError
             If the prior type is unknown or unsupported.
         """
-        # Numeric solver settings override the outer epoch budget. Only LC-ASH
-        # and PO-LC-ASH treat an explicit None as an unspecified budget.
         call_kwargs = dict(self.kwargs)
-        inherit_epochs = "n_epochs" not in call_kwargs or (
-            self.type in (LearnedPriorType.LCASH, LearnedPriorType.PO_LCASH) and call_kwargs["n_epochs"] is None
-        )
-        if inherit_epochs and internal_epoch is not None:
+        if self.type in (LearnedPriorType.LCASH, LearnedPriorType.PO_LCASH):
+            if call_kwargs.get("max_iter") is None and internal_epoch is not None:
+                call_kwargs["max_iter"] = 2 * internal_epoch
+        elif "n_epochs" not in call_kwargs and internal_epoch is not None:
             call_kwargs["n_epochs"] = internal_epoch
         # device is internal plumbing; user-passed values would be overridden anyway.
         call_kwargs.pop("device", None)

@@ -24,9 +24,7 @@ def test_lcash_posterior_means_mse_autoselect(n_samples):
         X=X,
         betahat=x,
         sebetahat=s,
-        n_epochs=100,
-        batch_size=256,
-        lr=1e-3,
+        max_iter=100,
         penalty=1.5,
         ash_init=False,
     )
@@ -57,9 +55,7 @@ def test_lcash_posterior_means_mse_inherit(n_samples):
         X=X,
         betahat=x,
         sebetahat=s,
-        n_epochs=100,
-        batch_size=256,
-        lr=1e-3,
+        max_iter=100,
         penalty=1.5,
         ash_init=True,
         ash_threshold=1e-6,
@@ -86,7 +82,7 @@ def test_lcash_warm_start():
         X=X,
         betahat=x,
         sebetahat=s,
-        n_epochs=20,
+        max_iter=20,
         ash_init=False,
     )
 
@@ -94,7 +90,7 @@ def test_lcash_warm_start():
         X=X,
         betahat=x,
         sebetahat=s,
-        n_epochs=20,
+        max_iter=20,
         ash_init=False,
         model_param=res1.model_param,
     )
@@ -141,9 +137,7 @@ def test_po_lcash_posterior_means_mse_autoselect(n_samples):
         X=X,
         betahat=x,
         sebetahat=s,
-        n_epochs=100,
-        batch_size=256,
-        lr=1e-3,
+        max_iter=100,
         penalty=1.5,
         ash_init=False,
     )
@@ -172,9 +166,7 @@ def test_po_lcash_posterior_means_mse_inherit(n_samples):
         X=X,
         betahat=x,
         sebetahat=s,
-        n_epochs=100,
-        batch_size=256,
-        lr=1e-3,
+        max_iter=100,
         penalty=1.5,
         ash_init=True,
         ash_threshold=1e-6,
@@ -201,7 +193,7 @@ def test_po_lcash_warm_start():
         X=X,
         betahat=x,
         sebetahat=s,
-        n_epochs=20,
+        max_iter=20,
         ash_init=False,
     )
 
@@ -209,7 +201,7 @@ def test_po_lcash_warm_start():
         X=X,
         betahat=x,
         sebetahat=s,
-        n_epochs=20,
+        max_iter=20,
         ash_init=False,
         model_param=res1.model_param,
     )

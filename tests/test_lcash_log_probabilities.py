@@ -46,21 +46,20 @@ def test_handoff_preserves_small_log_weights(model_class, weights, precision):
 def test_public_handoff_matches_retained_ash10_for_every_conditional_penalty(model_class, solver, penalty):
     x = torch.linspace(-6, 6, 128)
     se = torch.linspace(0.8, 1.2, len(x))
-    reference = ash(x, se, optimizer="lbfgs", penalty=10.0, zero_threshold=0)
+    reference = ash(x.double(), se.double(), optimizer="lbfgs", penalty=10.0, zero_threshold=0)
     active = reference.pi > 1e-6
-    scale = reference.scale[active].float()
+    scale = reference.scale[active]
     log_pi = reference.pi[active].double().log()
     log_pi -= torch.logsumexp(log_pi, 0)
-    # Both calculations use the same float32 component likelihoods.
-    log_lik = get_data_loglik_normal_torch(x, se, torch.zeros_like(scale), scale).double()
+    log_lik = get_data_loglik_normal_torch(x.double(), se.double(), torch.zeros_like(scale), scale)
     expected = posterior_mean_norm(x.double(), se.double(), log_pi, log_lik, scale.double())
     expected_mean_loss = -torch.logsumexp(log_lik + log_pi, dim=1).mean()
-    actual = solver(x[:, None], x, se, n_epochs=0, penalty=penalty, verbose=False)
+    actual = solver(x[:, None], x, se, max_iter=0, penalty=penalty, verbose=False)
 
-    torch.testing.assert_close(actual.scale, scale, rtol=0, atol=0)
-    model = model_class(1, actual.scale.numel())
+    torch.testing.assert_close(actual.scale, scale.float(), rtol=0, atol=0)
+    model = model_class(1, actual.scale.numel()).double()
     model.load_state_dict(actual.model_param["state_dict"])
-    actual_log_pi = model.log_probs(torch.tensor([[-2.0], [2.0]]))
+    actual_log_pi = model.log_probs(torch.tensor([[-2.0], [2.0]], dtype=torch.float64))
     torch.testing.assert_close(actual_log_pi.double(), log_pi.expand_as(actual_log_pi), rtol=0, atol=1e-5)
 
     eps = torch.finfo(torch.float32).eps
@@ -133,15 +132,15 @@ def test_single_spike_skips_optimizer_and_round_trips(solver, monkeypatch):
     def no_optimizer(*args, **kwargs):
         pytest.fail("A single-spike fit has no parameters to optimize.")
 
-    monkeypatch.setattr(torch.optim, "Adam", no_optimizer)
+    monkeypatch.setattr(torch.optim, "LBFGS", no_optimizer)
     x = torch.linspace(-2, 2, 32)
-    first = solver(x[:, None], x, torch.ones_like(x), n_epochs=3, verbose=False)
+    first = solver(x[:, None], x, torch.ones_like(x), max_iter=3, verbose=False)
     stream = io.BytesIO()
     torch.save(first.model_param, stream)
     stream.seek(0)
     saved = torch.load(stream, weights_only=True)
-    for epochs in (0, 2):
-        result = solver(x[:, None], x, torch.ones_like(x), model_param=saved, n_epochs=epochs, verbose=False)
+    for iterations in (0, 2):
+        result = solver(x[:, None], x, torch.ones_like(x), model_param=saved, max_iter=iterations, verbose=False)
         assert torch.equal(result.pi_np, torch.ones((32, 1)))
         for field in ("post_mean", "post_mean2", "post_sd"):
             assert torch.equal(getattr(result, field), torch.zeros_like(x))
@@ -166,7 +165,7 @@ def test_adaptive_cutoff_changes_only_above_boundary(n, expected, monkeypatch):
 def test_invalid_training_penalty_rejected(solver, penalty):
     x = torch.linspace(-3, 3, 32)
     with pytest.raises(ValueError, match="penalty"):
-        solver(x[:, None], x, torch.ones_like(x), penalty=penalty, n_epochs=1, verbose=False)
+        solver(x[:, None], x, torch.ones_like(x), penalty=penalty, max_iter=1, verbose=False)
 
 
 @pytest.mark.parametrize("solver", SOLVERS)
@@ -175,7 +174,7 @@ def test_zero_initialization_with_correlated_many_covariates(solver):
     latent = torch.randn(128, 1, generator=rng)
     features = latent + 0.1 * torch.randn(128, 128, generator=rng)
     observed = 3 * latent[:, 0] + torch.randn(128, generator=rng)
-    result = solver(features, observed, torch.ones(128), n_epochs=3, verbose=False)
+    result = solver(features, observed, torch.ones(128), max_iter=3, verbose=False)
     assert torch.isfinite(result.post_mean).all()
     assert torch.isfinite(result.post_sd).all()
     assert torch.isfinite(torch.tensor(result.loss))

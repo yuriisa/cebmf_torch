@@ -29,7 +29,7 @@ def controlled_ash(monkeypatch):
 
 def fit(solver, threshold):
     x = torch.linspace(-2, 2, 16)
-    return solver(x[:, None], x, torch.ones_like(x), ash_threshold=threshold, n_epochs=0, verbose=False)
+    return solver(x[:, None], x, torch.ones_like(x), ash_threshold=threshold, max_iter=0, verbose=False)
 
 
 @pytest.mark.parametrize("solver", SOLVERS)
