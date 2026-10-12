@@ -21,8 +21,8 @@ def make_model(prior, **kwargs):
         K=2,
         prior_L=prior,
         prior_F=prior,
-        X_l=torch.randn(24, 2, generator=generator),
-        X_f=torch.randn(18, 3, generator=generator),
+        X_l=kwargs.pop("X_l", torch.randn(24, 2, generator=generator)),
+        X_f=kwargs.pop("X_f", torch.randn(18, 3, generator=generator)),
         prior_L_kwargs=prior_kwargs,
         prior_F_kwargs=prior_kwargs,
         S=1.0,
@@ -86,17 +86,68 @@ def test_cebmf_repeated_updates_retain_each_factor_grid(prior, monkeypatch):
 
 
 @pytest.mark.parametrize("prior", PRIOR_TYPES)
-@pytest.mark.parametrize("side", ("row", "col"))
-def test_cebmf_pruning_rejects_changed_self_covariate_count(prior, side):
+@pytest.mark.parametrize("sides", (("row",), ("col",), ("row", "col")))
+@pytest.mark.parametrize("external", (True, False))
+def test_cebmf_pruning_refits_changed_self_covariates(prior, sides, external, monkeypatch):
     # A zero pruning threshold deterministically retains only the first factor.
-    model = make_model(prior, prune_thresh=0.0, **{f"self_{side}_cov": True})
+    options = {f"self_{side}_cov": True for side in sides}
+    if not external:
+        options.update({"X_l" if side == "row" else "X_f": None for side in sides})
+    model = make_model(prior, prune_thresh=0.0, **options)
+    calls = []
+    real_fit = LearnedBuilder.fit
+
+    def record_fit(builder, **kwargs):
+        result = real_fit(builder, **kwargs)
+        calls.append((kwargs, result.model_param))
+        return result
+
+    monkeypatch.setattr(LearnedBuilder, "fit", record_fit)
     model.fit(maxit=1)
     assert model.model.K == 1
-    saved = model.model_state_L[0] if side == "row" else model.model_state_F[0]
-    external = model.covariate.X_l if side == "row" else model.covariate.X_f
-    assert saved["feature_mean"].numel() == external.shape[1] + 1
+    for index, side in enumerate(("row", "col")):
+        saved = model.model_state_L[0] if side == "row" else model.model_state_F[0]
+        assert saved is (None if side in sides else calls[index][1])
 
-    # Pruning removed the other-factor covariate. Its old fitted coefficients
-    # cannot be reinterpreted as coefficients for the remaining columns.
-    with pytest.raises(ValueError, match="covariate columns"):
-        model.fit(maxit=1)
+    result = model.fit(maxit=1)
+    assert len(calls) == 6  # Both sides, two factors before pruning and one after.
+    assert torch.isfinite(result.L).all()
+    assert torch.isfinite(result.F).all()
+    assert torch.isfinite(torch.tensor(result.history_obj)).all()
+    for index, side in enumerate(("row", "col")):
+        first, first_state = calls[index]
+        continued, continued_state = calls[4 + index]
+        assert continued["model_param"] is (None if side in sides else first_state)
+        assert continued_state["feature_mean"].numel() == continued["X"].shape[1]
+        if side in sides:
+            if external:
+                assert continued["X"].shape[1] == first["X"].shape[1] - 1
+            else:
+                # One other-factor feature becomes one constant feature.
+                assert first["X"].shape == continued["X"].shape
+                assert torch.std(first["X"]) > 0
+                torch.testing.assert_close(continued["X"], torch.ones_like(continued["X"]))
+                torch.testing.assert_close(
+                    continued_state["feature_mean"], torch.ones_like(continued_state["feature_mean"])
+                )
+
+
+@pytest.mark.parametrize("prior", PRIOR_TYPES)
+def test_cebmf_no_pruning_retains_self_covariate_states(prior, monkeypatch):
+    model = make_model(prior, prune_thresh=1.1, self_row_cov=True, self_col_cov=True)
+    model.fit(maxit=1)
+    assert model.model.K == 2
+    saved = (model.model_state_L.copy(), model.model_state_F.copy())
+    calls = []
+    real_fit = LearnedBuilder.fit
+
+    def record_fit(builder, **kwargs):
+        calls.append(kwargs["model_param"])
+        return real_fit(builder, **kwargs)
+
+    monkeypatch.setattr(LearnedBuilder, "fit", record_fit)
+    model.fit(maxit=1)
+    assert model.model.K == 2
+    for factor in range(2):
+        assert calls[2 * factor] is saved[0][factor]
+        assert calls[2 * factor + 1] is saved[1][factor]

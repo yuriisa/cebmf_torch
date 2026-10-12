@@ -282,8 +282,9 @@ Within cEBMF, fitted state is passed between successive factor updates.
 For LC-ASH and PO-LC-ASH, omitted or ``None`` inner ``n_epochs`` inherits
 ``internal_epoch``. An explicit zero or positive value overrides it.
 The standalone default is 200 epochs.
-If factor pruning changes the number of covariate columns, the next update
-raises ``ValueError`` because the saved state requires the original column count.
+Factor pruning clears saved prior states on sides that use self-covariates,
+because their feature columns change. The next update fits those priors to
+the current covariates. States on sides with only external covariates are retained.
 
 Custom Initialization
 ~~~~~~~~~~~~~~~~~~~~~
