@@ -148,3 +148,24 @@ def test_further_training_does_not_mutate_previous_state(solver, fit_inputs):
         not torch.equal(value, updated.model_param["state_dict"][key])
         for key, value in first.model_param["state_dict"].items()
     )
+
+
+@pytest.mark.parametrize("solver", SOLVERS)
+def test_mps_saved_state_is_restored_before_float64_conversion(solver, fit_inputs):
+    if not torch.backends.mps.is_available():
+        pytest.skip("MPS is not available")
+    X, betahat, se, options = fit_inputs
+    first = solver(X, betahat, se, **options)
+    state = copy.deepcopy(first.model_param)
+    for key in ("scale", "feature_mean", "feature_sd"):
+        state[key] = state[key].float().to("mps")
+    state["state_dict"] = {key: value.float().to("mps") for key, value in state["state_dict"].items()}
+    restored = solver(X.to("mps"), betahat.to("mps"), se.to("mps"), model_param=state, **(options | {"device": "mps"}))
+    for field in ("pi_np", "post_mean", "post_mean2", "post_sd"):
+        actual = getattr(restored, field)
+        assert actual.device.type == "mps"
+        torch.testing.assert_close(actual.cpu(), getattr(first, field), rtol=1e-5, atol=1e-6)
+    for key in ("scale", "feature_mean", "feature_sd"):
+        assert restored.model_param[key].device.type == "cpu"
+        assert restored.model_param[key].dtype == torch.float64
+        assert state[key].device.type == "mps"

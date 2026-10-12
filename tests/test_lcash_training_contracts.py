@@ -3,13 +3,16 @@
 import importlib
 import math
 import warnings
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
 
+from cebmf_torch import cEBMF
 from cebmf_torch.cebnm.lcash import LcashNet, PropOddsLcashNet, lcash_posterior_means, po_lcash_posterior_means
+from cebmf_torch.priors.learned import LearnedBuilder, LearnedPriorType
 
 lcash = importlib.import_module("cebmf_torch.cebnm.lcash")
 SOLVERS = [lcash_posterior_means, po_lcash_posterior_means]
@@ -178,6 +181,66 @@ def test_training_state_keeps_float64_and_outputs_keep_requested_device(solver, 
 
 
 @pytest.mark.parametrize("solver", SOLVERS)
+@pytest.mark.parametrize("ash_init", [False, True])
+def test_mps_default_device_is_preserved_after_cpu_fit(solver, ash_init):
+    if not torch.backends.mps.is_available():
+        pytest.skip("MPS is not available")
+    previous = torch.get_default_device()
+    try:
+        torch.set_default_device("mps")
+        x = torch.linspace(-4, 4, 32)
+        result = solver(x[:, None], x, torch.ones_like(x), ash_init=ash_init, max_iter=2)
+        assert torch.get_default_device().type == "mps"
+        assert result.post_mean.device.type == "mps"
+        assert result.model_param["scale"].device.type == "cpu"
+        assert math.isfinite(result.loss)
+    finally:
+        torch.set_default_device(previous)
+
+
+def test_po_mps_log_weights_initialize_on_requested_device():
+    if not torch.backends.mps.is_available():
+        pytest.skip("MPS is not available")
+    log_pi = torch.tensor([0.6, 0.3, 0.1], device="mps").log()
+    model = PropOddsLcashNet(2, 3, log_pi_init=log_pi)
+    assert all(parameter.device.type == "mps" for parameter in model.parameters())
+    actual = model.log_probs(torch.zeros(2, 2, device="mps"))
+    expected = log_pi - torch.logsumexp(log_pi, 0)
+    torch.testing.assert_close(actual, expected.expand_as(actual), atol=1e-6, rtol=1e-6)
+
+
+def test_python_inputs_retain_float64_precision():
+    value = 1 + 2**-40
+    features, observed, standard_error = lcash._prepare_inputs([value], [value], [value], torch.device("cpu"))
+    for tensor in (features, observed, standard_error):
+        assert tensor.dtype == torch.float64
+        assert tensor.item() == value
+
+
+def test_native_po_line_search_recovers_from_large_gap_trial():
+    # This heteroscedastic normal-means problem produces an overflowing trial
+    # under the native strong-Wolfe line search when gaps are unbounded.
+    rng = np.random.default_rng(96153)
+    n = 1000
+    raw_features = rng.normal(size=(n, 2))
+    features = torch.tensor((raw_features - raw_features.mean(0)) / raw_features.std(0), dtype=torch.float64)
+    truth = np.where(features[:, 0].numpy() > 0, rng.normal(size=n) * 3, 0)
+    se = np.exp(rng.uniform(np.log(0.01), np.log(0.8), n))
+    observed = torch.tensor(truth + rng.normal(size=n) * se, dtype=torch.float64)
+    se = torch.tensor(se, dtype=torch.float64)
+    scale = torch.tensor([0, 0.01, 0.05, 0.2, 0.5, 1.0, 3.0, 10.0], dtype=torch.float64)
+    model = PropOddsLcashNet(2, len(scale), torch.tensor(rng.normal(size=len(scale)), dtype=torch.float64))
+    log_lik = lcash.get_data_loglik_normal_torch(observed, se, torch.zeros_like(scale), scale)
+    lcash._train_model(model, features, log_lik, 500, 1, False, "PO-LC-ASH")
+    assert all(
+        torch.isfinite(parameter).all() and torch.isfinite(parameter.grad).all() for parameter in model.parameters()
+    )
+    posterior = lcash._compute_posteriors(model, features, observed, se, scale, log_lik)
+    for value in posterior:
+        assert torch.isfinite(torch.as_tensor(value)).all()
+
+
+@pytest.mark.parametrize("solver", SOLVERS)
 @pytest.mark.parametrize("options", [{}, {"max_iter": None}, {"max_iter": 0}, {"max_iter": 7}])
 def test_standalone_iteration_default_and_zero_prediction(solver, options, fixed_grid, monkeypatch):
     calls = []
@@ -218,6 +281,31 @@ def test_incomplete_fit_warning_identifies_stop_reason(model_class, stop, monkey
             label="test",
         )
     assert all(torch.isfinite(parameter).all() for parameter in model.parameters())
+
+
+@pytest.mark.parametrize("prior_type", [LearnedPriorType.LCASH, LearnedPriorType.PO_LCASH])
+@pytest.mark.parametrize("call_path", ["direct", "builder", "cebmf"])
+def test_incomplete_fit_warning_points_to_calling_code(prior_type, call_path, fixed_grid):
+    x = torch.linspace(-3, 3, 100)
+    with pytest.warns(RuntimeWarning, match="gradient tolerance") as captured:
+        if call_path == "cebmf":
+            model = cEBMF(
+                torch.stack((x, x.sin(), x.square(), x.cos()), dim=1),
+                K=1,
+                prior_L=prior_type.value,
+                prior_L_kwargs={"max_iter": 1},
+                X_l=x[:, None],
+                device="cpu",
+            )
+            model.initialise_factors()
+            model.fit(maxit=1)
+        elif call_path == "builder":
+            builder = LearnedBuilder(prior_type, max_iter=1)
+            builder.fit(x[:, None], x, torch.ones_like(x))
+        else:
+            solver = lcash_posterior_means if prior_type == LearnedPriorType.LCASH else po_lcash_posterior_means
+            solver(x[:, None], x, torch.ones_like(x), max_iter=1)
+    assert all(Path(warning.filename).resolve() == Path(__file__).resolve() for warning in captured)
 
 
 def test_converged_fit_has_no_incomplete_fit_warning():

@@ -116,15 +116,16 @@ def test_po_large_finite_gap_full_loss_and_gradient(precision):
     assert all(p.grad is None or torch.isfinite(p.grad).all() for p in model.parameters())
 
 
-def test_po_overflow_is_rejected_before_posterior_result(precision):
+def test_po_finite_gap_overflow_returns_finite_posterior_result(precision):
     model = PropOddsLcashNet(1, 3)
     with torch.no_grad():
         model.delta_gaps.fill_(89 if precision == torch.float32 else 710)
     x = torch.zeros(2)
-    with pytest.raises(FloatingPointError, match="log probabilities.*finite"):
-        lcash._compute_posteriors(
-            model, x[:, None], x, torch.ones_like(x), torch.tensor([0.0, 1.0, 2.0]), torch.zeros(2, 3)
-        )
+    result = lcash._compute_posteriors(
+        model, x[:, None], x, torch.ones_like(x), torch.tensor([0.0, 1.0, 2.0]), torch.zeros(2, 3)
+    )
+    for value in result:
+        assert torch.isfinite(torch.as_tensor(value)).all()
 
 
 @pytest.mark.parametrize("solver", SOLVERS)

@@ -36,23 +36,39 @@ def test_gap_switch_matches_decimal_values_and_derivatives(dtype):
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
-def test_po_rejects_cumulative_cutpoint_overflow_with_finite_gaps(dtype):
+@pytest.mark.parametrize("log_gap", [None, 1000.0])
+def test_po_large_finite_gaps_keep_cutpoints_and_gradients_finite(dtype, log_gap):
     model = PropOddsLcashNet(1, 4).to(dtype=dtype)
     with torch.no_grad():
         model.w.zero_()
         model.delta_1.zero_()
-        model.delta_gaps.fill_(math.log(torch.finfo(dtype).max * 0.75))
-    assert torch.isfinite(model.delta_gaps.exp()).all()
+        model.delta_gaps.fill_(math.log(torch.finfo(dtype).max * 0.75) if log_gap is None else log_gap)
     x = torch.zeros(2, dtype=dtype)
-    with pytest.raises(FloatingPointError, match="log probabilities.*finite"):
-        lcash._compute_posteriors(
-            model,
-            x[:, None],
-            x,
-            torch.ones_like(x),
-            torch.tensor([0.0, 1.0, 2.0, 4.0], dtype=dtype),
-            torch.zeros(2, 4, dtype=dtype),
-        )
+    cuts = model._get_cutpoints()
+    assert torch.isfinite(cuts).all()
+    assert torch.all(cuts[1:] > cuts[:-1])
+    log_pi = model.log_probs(x[:, None])
+    log_lik = torch.tensor([[-2.0, -1.0, -3.0, -4.0]], dtype=dtype)
+    loss = -torch.logsumexp(log_pi + log_lik, dim=1).sum()
+    loss.backward()
+    assert torch.isfinite(log_pi).all() and torch.isfinite(loss)
+    assert all(torch.isfinite(parameter.grad).all() for parameter in model.parameters())
+    torch.testing.assert_close(model.delta_gaps.grad, torch.zeros_like(model.delta_gaps), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_po_gap_cap_preserves_representable_cutpoints_and_derivatives(dtype):
+    model = PropOddsLcashNet(1, 4).to(dtype=dtype)
+    cap = math.log(torch.finfo(dtype).max) - math.log(4) - 1
+    with torch.no_grad():
+        model.delta_1.fill_(0.3)
+        model.delta_gaps.copy_(torch.tensor([-2.0, cap - 1], dtype=dtype))
+    expected = torch.cat([model.delta_1, model.delta_1 + model.delta_gaps.exp().cumsum(0)])
+    actual = model._get_cutpoints()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    actual_gradient = torch.autograd.grad(actual.sum(), model.delta_gaps)[0]
+    expected_gradient = torch.autograd.grad(expected.sum(), model.delta_gaps)[0]
+    torch.testing.assert_close(actual_gradient, expected_gradient, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(
@@ -104,8 +120,6 @@ def test_nonfinite_trial_gradient_restores_model_and_does_not_return_a_fit(model
         (lcash_posterior_means, math.inf, "Conditional .*finite"),
         (po_lcash_posterior_means, math.nan, "Conditional .*finite"),
         (po_lcash_posterior_means, math.inf, "Conditional .*finite"),
-        (po_lcash_posterior_means, 710.0, "Conditional .*finite"),
-        (po_lcash_posterior_means, math.log(torch.finfo(torch.float64).max * 0.75), "Conditional .*finite"),
     ],
 )
 def test_invalid_final_lbfgs_step_is_not_returned_as_a_fit(solver, value, error, monkeypatch):
@@ -132,6 +146,31 @@ def test_invalid_final_lbfgs_step_is_not_returned_as_a_fit(solver, value, error,
     with pytest.raises(FloatingPointError, match=error):
         solver(x[:, None], x, torch.ones_like(x), max_iter=1, verbose=False)
     assert calls == [True]
+
+
+@pytest.mark.parametrize("value", [710.0, math.log(torch.finfo(torch.float64).max * 0.75)])
+def test_finite_large_gap_at_final_lbfgs_step_returns_finite_posteriors(value, monkeypatch):
+    monkeypatch.setattr(
+        lcash,
+        "ash",
+        lambda *args, **kwargs: SimpleNamespace(
+            pi=torch.tensor([0.6, 0.2, 0.15, 0.05]), scale=torch.tensor([0.0, 1.0, 2.0, 4.0])
+        ),
+    )
+    original_step = torch.optim.LBFGS.step
+
+    def large_gap_step(optimizer, *args, **kwargs):
+        result = original_step(optimizer, *args, **kwargs)
+        with torch.no_grad():
+            optimizer.param_groups[0]["params"][-1].fill_(value)
+        return result
+
+    monkeypatch.setattr(torch.optim.LBFGS, "step", large_gap_step)
+    x = torch.linspace(-2.0, 2.0, 8)
+    result = po_lcash_posterior_means(x[:, None], x, torch.ones_like(x), max_iter=1)
+    assert math.isfinite(result.loss)
+    for field in ("post_mean", "post_mean2", "post_sd", "pi_np"):
+        assert torch.isfinite(getattr(result, field)).all()
 
 
 @pytest.mark.parametrize("solver", [lcash_posterior_means, po_lcash_posterior_means])

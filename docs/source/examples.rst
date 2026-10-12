@@ -237,8 +237,12 @@ The standardized covariate coefficients have independent Student-t priors,
 evaluated with native ``torch.distributions.StudentT``. The defaults are
 ``coefficient_prior_scale=1.0`` and ``coefficient_prior_df=5.0``, with location
 zero. Both parameters must be finite and positive for training. Scale is the
-distribution's scale parameter, not its standard deviation. Set ``coefficient_prior_scale=None``
-to disable this prior.
+distribution's scale parameter, not its standard deviation. The default has
+standard deviation 1.29 and places 95% of its mass between -2.57 and 2.57.
+`Stan's prior-choice guidance <https://github.com/stan-dev/stan/wiki/Prior-Choice-Recommendations>`_
+supports Student-t priors with moderate degrees of freedom and scales chosen
+for the parameter's units; it does not prescribe these exact defaults.
+Set ``coefficient_prior_scale=None`` to disable this prior.
 
 For LC-ASH, the prior applies to each non-null component's slope minus the
 null component's slope. These contrasts describe component-versus-null log odds;
@@ -253,6 +257,9 @@ training objective. It regularizes covariate effects separately from the
 null penalty. Returned ``loss`` excludes both prior terms: it is the summed
 negative marginal log likelihood required by cEBMF.
 
+PO-LC-ASH caps log cut-point gaps at the floating-point range limit before
+exponentiation, leaving room for their cumulative sum. This keeps very large,
+finite trial gaps from overflowing. Values below the cap are unchanged.
 The solver raises ``FloatingPointError`` if an optimization trial has a
 non-finite loss or gradient. It restores the initial parameters before raising;
 a failed trial does not establish that no finite optimum exists. A finite fit
@@ -267,8 +274,11 @@ convergence. Fits are quiet by default; ``verbose=True`` prints the final
 iteration count, evaluation count, mean objective and maximum gradient.
 
 Fitting and saved state use float64. MPS fits run on CPU because MPS does
-not support float64. Returned posterior summaries, weights and scales use
-float32 on the requested device.
+not support float64. MPS inputs and saved parameters move to CPU before
+conversion to float64. A native PyTorch device context keeps intermediate
+allocations on the fitting device and preserves the caller's default device.
+Returned posterior summaries, weights and scales use float32 on the requested
+device.
 
 The returned ``model_param`` contains the selected component grid, fitted
 regression parameters, covariate means and standard deviations used for
@@ -306,12 +316,14 @@ iterations per call. ``po_lcash_posterior_means`` supports the same calling patt
     betahat = 2.0 * X[:, 0] + 0.2 * torch.randn(128, generator=generator)
     se = torch.full_like(betahat, 0.2)
 
-    first = lcash_posterior_means(
-        X, betahat, se, max_iter=100, device="cpu", verbose=False
+    fit_options = dict(
+        max_iter=100, penalty=10, coefficient_prior_scale=1.0,
+        coefficient_prior_df=5.0, device="cpu", verbose=False
     )
+    first = lcash_posterior_means(X, betahat, se, **fit_options)
     updated = lcash_posterior_means(
         X, betahat + 0.05, se, model_param=first.model_param,
-        max_iter=100, device="cpu", verbose=False
+        **fit_options
     )
     torch.testing.assert_close(updated.scale, first.scale)
 

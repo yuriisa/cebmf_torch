@@ -160,3 +160,20 @@ def test_removed_conditional_options_fail_at_configuration(prior_name, removed):
     with pytest.raises(TypeError, match=rf"{removed}.*max_iter"):
         builder.set_kwargs(**{removed: 1})
     assert builder.kwargs == {}
+
+
+@pytest.mark.parametrize("prior_name", ["lcash", "po_lcash"])
+@pytest.mark.parametrize("reserved", ["X", "betahat", "sebetahat", "model_param"])
+def test_reserved_conditional_options_fail_at_configuration(prior_name, reserved):
+    with pytest.raises(TypeError, match=reserved):
+        cEBMF(
+            torch.ones(6, 4),
+            K=1,
+            prior_L=prior_name,
+            prior_L_kwargs={reserved: None},
+            device="cpu",
+        )
+    builder = learned.LearnedBuilder(learned.LearnedPriorType(prior_name), penalty=10)
+    with pytest.raises(TypeError, match=reserved):
+        builder.set_kwargs(**{reserved: None})
+    assert builder.kwargs == {"penalty": 10}

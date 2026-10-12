@@ -93,7 +93,7 @@ class LearnedBuilder(PriorBuilder):
         """
         if self.type in (LearnedPriorType.LCASH, LearnedPriorType.PO_LCASH):
             try:
-                signature(builder_functions[self.type]).bind_partial(**new_kwargs)
+                signature(builder_functions[self.type]).bind_partial(None, None, None, model_param=None, **new_kwargs)
             except TypeError as error:
                 raise TypeError(
                     f"Invalid {self.type} options: {error}. Use max_iter to set the L-BFGS iteration budget."
