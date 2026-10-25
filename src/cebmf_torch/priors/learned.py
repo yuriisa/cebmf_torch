@@ -12,6 +12,7 @@ from cebmf_torch.cebnm.cov_sharp_gb_prior import sharp_cgb_posterior_means
 from cebmf_torch.cebnm.emdn import emdn_posterior_means
 from cebmf_torch.cebnm.hmm import hmm_neg_posterior_means, hmm_pos_posterior_means, hmm_posterior_means
 from cebmf_torch.cebnm.lcash import lcash_posterior_means, po_lcash_posterior_means
+from cebmf_torch.cebnm.md_ash import _roles, md_ash_posterior_means, predict_md_ash
 from cebmf_torch.cebnm.spiked_emdn import spiked_emdn_posterior_means
 
 from .base import Prior, PriorBuilder
@@ -41,6 +42,8 @@ class LearnedPriorType(StrEnum):
         Linear Covariate Adaptive Shrinkage (softmax / multinomial logistic).
     PO_LCASH : str
         Proportional Odds LC-ASH (ordered logistic).
+    MD_ASH : str
+        Half-normal magnitude-and-direction adaptive shrinkage.
     SPIKED_EMDN : str
         Spiked Empirical Mixture Density Network prior.
     """
@@ -55,6 +58,7 @@ class LearnedPriorType(StrEnum):
     HMM_NEG = auto()
     LCASH = auto()
     PO_LCASH = auto()
+    MD_ASH = auto()
     SPIKED_EMDN = auto()
 
 
@@ -69,6 +73,7 @@ builder_functions: dict[LearnedPriorType, Callable] = {
     LearnedPriorType.HMM_NEG: hmm_neg_posterior_means,
     LearnedPriorType.LCASH: lcash_posterior_means,
     LearnedPriorType.PO_LCASH: po_lcash_posterior_means,
+    LearnedPriorType.MD_ASH: md_ash_posterior_means,
     LearnedPriorType.SPIKED_EMDN: spiked_emdn_posterior_means,
 }
 
@@ -96,6 +101,7 @@ class LearnedBuilder(PriorBuilder):
         """
         self.type = type
         self.kwargs = kwargs
+        self._external_covariate_roles = None
 
     def set_kwargs(self, **new_kwargs: Any) -> None:
         """
@@ -107,6 +113,12 @@ class LearnedBuilder(PriorBuilder):
             New keyword arguments to set, replacing the old ones.
         """
         self.kwargs = new_kwargs
+        self._external_covariate_roles = None
+
+    def _set_external_covariate_roles(self, n_external: int) -> None:
+        """MD-ASH uses magnitude roles for appended earlier factors."""
+        if self.type == LearnedPriorType.MD_ASH:
+            self._external_covariate_roles = _roles(self.kwargs.get("covariate_roles"), n_external)
 
     @property
     def name(self) -> str:
@@ -128,6 +140,7 @@ class LearnedBuilder(PriorBuilder):
         model_param: Any | None = None,
         internal_epoch: int | None = None,
         device: torch.device | None = None,
+        observed: Tensor | None = None,
     ) -> Prior:
         """
         Fit the learned prior to the data.
@@ -144,13 +157,16 @@ class LearnedBuilder(PriorBuilder):
             Additional model parameters (default: None).
         internal_epoch : int, optional
             Training epochs when ``n_epochs`` is omitted. ``lcash_posterior_means``
-            and ``po_lcash_posterior_means`` use twice this value as their
+            and the PO-LC-ASH and MD-ASH solvers use twice this value as their
             L-BFGS iteration budget when
             ``max_iter`` is omitted or None. Explicit numeric solver budgets,
             including zero, take precedence.
         device : torch.device, optional
             Requested output device, forwarded to the solver. The solver controls
             its training device. When None, the solver chooses its default device.
+        observed : torch.Tensor, optional
+            MD-ASH factor-update mask. Only these rows inform fitting. Other rows
+            receive the conditional prior. Other learned priors do not use it.
 
         Returns
         -------
@@ -163,21 +179,47 @@ class LearnedBuilder(PriorBuilder):
             If the prior type is unknown or unsupported.
         """
         call_kwargs = dict(self.kwargs)
-        if self.type in (LearnedPriorType.LCASH, LearnedPriorType.PO_LCASH):
+        if self.type in (LearnedPriorType.LCASH, LearnedPriorType.PO_LCASH, LearnedPriorType.MD_ASH):
             if call_kwargs.get("max_iter") is None and internal_epoch is not None:
                 call_kwargs["max_iter"] = 2 * internal_epoch
         elif "n_epochs" not in call_kwargs and internal_epoch is not None:
             call_kwargs["n_epochs"] = internal_epoch
         # device is internal plumbing; user-passed values would be overridden anyway.
         call_kwargs.pop("device", None)
+        if self._external_covariate_roles is not None:
+            n_features = 0 if X is None else X.shape[1]
+            n_external = len(self._external_covariate_roles)
+            if n_features < n_external:
+                raise ValueError("X has fewer columns than the configured external covariates.")
+            call_kwargs["covariate_roles"] = self._external_covariate_roles + ("magnitude",) * (
+                n_features - n_external
+            )
+        fit_X, fit_y, fit_se = X, betahat, sebetahat
+        if observed is not None:
+            if self.type != LearnedPriorType.MD_ASH:
+                raise ValueError("The observed fitting mask is currently supported only for MD-ASH.")
+            if observed.dtype != torch.bool or observed.shape != betahat.shape:
+                raise ValueError("observed must be a boolean vector matching betahat.")
+            if not observed.any():
+                raise ValueError("MD-ASH fitting needs at least one row with positive likelihood precision.")
+            fit_X = None if X is None else X[observed]
+            fit_y, fit_se = betahat[observed], sebetahat[observed]
         obj = builder_functions[self.type](
-            X,
-            betahat,
-            sebetahat,
+            fit_X,
+            fit_y,
+            fit_se,
             model_param=model_param,
             device=device,
             **call_kwargs,
         )
+        if observed is not None and not observed.all():
+            prediction = predict_md_ash(X, betahat, sebetahat, observed=observed, model_param=obj.model_param)
+            obj.post_mean, obj.post_mean2, obj.post_sd = (
+                prediction.post_mean,
+                prediction.post_mean2,
+                prediction.post_sd,
+            )
+            obj.pi_np = prediction.log_pi.exp()
 
         # A bit annoying that the different types have different ways of handling pi0
         match self.type:
@@ -185,6 +227,7 @@ class LearnedBuilder(PriorBuilder):
                 LearnedPriorType.CASH
                 | LearnedPriorType.LCASH
                 | LearnedPriorType.PO_LCASH
+                | LearnedPriorType.MD_ASH
                 | LearnedPriorType.SPIKED_EMDN
             ):
                 # optional: could expose from obj.pi_np

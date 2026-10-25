@@ -25,7 +25,7 @@ jobs:
         version: "latest"
 
     - name: Install dependencies
-      run: uv sync
+      run: uv sync -p 3.12
 
     - name: Get changed Python files
       id: changed-files
@@ -38,12 +38,12 @@ jobs:
       if: steps.changed-files.outputs.any_changed == 'true'
       run: |
         echo "Changed Python files: ${{ steps.changed-files.outputs.all_changed_files }}"
-        uv run ruff format ${{ steps.changed-files.outputs.all_changed_files }}
+        uv run -p 3.12 ruff format ${{ steps.changed-files.outputs.all_changed_files }}
 
     - name: Run Ruff check on changed files
       if: steps.changed-files.outputs.any_changed == 'true'
       run: |
-        uv run ruff check --fix ${{ steps.changed-files.outputs.all_changed_files }}
+        uv run -p 3.12 ruff check --fix ${{ steps.changed-files.outputs.all_changed_files }}
 
     - name: Check for changes
       id: verify-changed-files
