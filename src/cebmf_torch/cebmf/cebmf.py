@@ -370,6 +370,16 @@ class cEBMF:
         self._recompute_residual()
 
     @torch.no_grad()
+    def _zero_unidentified_factor_side(self, side: str, k: int) -> None:
+        """Deactivate a factor side with no likelihood precision before pruning."""
+        getattr(self, side)[:, k] = 0
+        getattr(self, side + "2")[:, k] = 0
+        getattr(self, f"model_state_{side}")[k] = None
+        getattr(self, f"kl_{side.lower()}")[k] = 0
+        getattr(self, f"regularization_{side.lower()}")[k] = 0
+        getattr(self, f"pi0_{side}")[k] = 1.0
+
+    @torch.no_grad()
     def _update_L_factor(self, k: int, Rk: Tensor, tau_map: Tensor | None, eps: float) -> None:
         """Update L[:,k] and L2[:,k] using provided Rk (residual with k added back)."""
         mask_f = self.mask if self.mask.dtype.is_floating_point else self.mask.to(self.L.dtype)
@@ -377,16 +387,23 @@ class cEBMF:
         Fk2 = self.F2[:, k]
 
         if tau_map is None:
-            denom_l = (mask_f @ Fk2).clamp_min(eps)  # (N,)
+            raw_denom_l = mask_f @ Fk2
+            denom_l = raw_denom_l.clamp_min(eps)  # (N,)
             num_l = Rk @ Fk  # (N,)
             se_l = torch.sqrt(1.0 / (self.tau * denom_l))
         else:
             W = tau_map * mask_f
-            denom_l = (W @ Fk2).clamp_min(eps)  # (N,)
+            raw_denom_l = W @ Fk2
+            denom_l = raw_denom_l.clamp_min(eps)  # (N,)
             num_l = (W * Rk) @ Fk  # (N,)
             se_l = torch.sqrt(1.0 / denom_l)
 
         lhat = num_l / denom_l
+        # MD-ASH fits informative rows and predicts the conditional prior elsewhere.
+        observed_l = raw_denom_l > 0 if self.prior_L_fn.name == "md_ash" else None
+        if observed_l is not None and not observed_l.any():
+            self._zero_unidentified_factor_side("L", k)
+            return
 
         # fit prior for L
         X_model = self._build_covariate_matrix(
@@ -404,13 +421,14 @@ class cEBMF:
                 sebetahat=se_l,
                 model_param=self.model_state_L[k],
                 device=self.device,
+                **({"observed": observed_l} if observed_l is not None else {}),
             )
 
         # write back
         self.model_state_L[k] = resL.model_param
         self.L[:, k] = resL.post_mean
         self.L2[:, k] = resL.post_mean2
-        nm_ll_L = normal_means_loglik(x=lhat, s=se_l, Et=resL.post_mean, Et2=resL.post_mean2)
+        nm_ll_L = normal_means_loglik(x=lhat, s=se_l, Et=resL.post_mean, Et2=resL.post_mean2, mask=observed_l)
         # KL(q || prior) = E_q[log likelihood] - log marginal likelihood.
         self.kl_l[k] = torch.as_tensor(nm_ll_L + resL.loss, device=self.device, dtype=self.L.dtype)
         self.regularization_l[k] = resL.regularization_loss
@@ -424,16 +442,22 @@ class cEBMF:
         Lk2 = self.L2[:, k]
 
         if tau_map is None:
-            denom_f = (mask_f.T @ Lk2).clamp_min(eps)  # (P,)
+            raw_denom_f = mask_f.T @ Lk2
+            denom_f = raw_denom_f.clamp_min(eps)  # (P,)
             num_f = Rk.T @ Lk  # (P,)
             se_f = torch.sqrt(1.0 / (self.tau * denom_f))
         else:
             W = tau_map * mask_f
-            denom_f = (W.T @ Lk2).clamp_min(eps)
+            raw_denom_f = W.T @ Lk2
+            denom_f = raw_denom_f.clamp_min(eps)
             num_f = (W * Rk).transpose(0, 1) @ Lk
             se_f = torch.sqrt(1.0 / denom_f)
 
         fhat = num_f / denom_f
+        observed_f = raw_denom_f > 0 if self.prior_F_fn.name == "md_ash" else None
+        if observed_f is not None and not observed_f.any():
+            self._zero_unidentified_factor_side("F", k)
+            return
 
         # fit prior for F
         X_model = self._build_covariate_matrix(
@@ -451,13 +475,14 @@ class cEBMF:
                 internal_epoch=self.internal_epoch,
                 model_param=self.model_state_F[k],
                 device=self.device,
+                **({"observed": observed_f} if observed_f is not None else {}),
             )
 
         # write back
         self.model_state_F[k] = resF.model_param
         self.F[:, k] = resF.post_mean
         self.F2[:, k] = resF.post_mean2
-        nm_ll_F = normal_means_loglik(x=fhat, s=se_f, Et=resF.post_mean, Et2=resF.post_mean2)
+        nm_ll_F = normal_means_loglik(x=fhat, s=se_f, Et=resF.post_mean, Et2=resF.post_mean2, mask=observed_f)
         self.kl_f[k] = torch.as_tensor(nm_ll_F + resF.loss, device=self.device, dtype=self.F.dtype)
         self.regularization_f[k] = resF.regularization_loss
         self.pi0_F[k] = resF.pi0_null
@@ -544,6 +569,9 @@ class cEBMF:
         self.prior_L_fn.set_kwargs(**prior_L_kwargs)
         self.prior_F_fn = copy(PRIOR_REGISTRY.get_builder(self.model.prior_F))
         self.prior_F_fn.set_kwargs(**prior_F_kwargs)
+        for builder, external in ((self.prior_L_fn, self.covariate.X_l), (self.prior_F_fn, self.covariate.X_f)):
+            if builder.name == "md_ash":
+                builder._set_external_covariate_roles(0 if external is None else external.shape[1])
         self.model_state_L = [None] * self.model.K
         self.model_state_F = [None] * self.model.K
 

@@ -403,11 +403,12 @@ def _train_model(
     label: str,
     coefficient_prior_scale: float | None = 1.0,
     coefficient_prior_df: float = 5.0,
-) -> None:
+) -> dict:
     """Fit the mean objective with nullweight and optional Student-t slope priors.
 
     A non-finite objective or gradient raises instead of returning a fit.
     Each call uses fresh curvature history for its normal-means problem.
+    Return endpoint diagnostics for callers that need to retain them.
     """
     model.train()
     params = list(model.parameters())
@@ -451,6 +452,20 @@ def _train_model(
             f"Evaluations: {state['func_evals']} | Mean loss: {final_loss:.8g} | "
             f"Max gradient: {grad_max:.3g}"
         )
+
+    group, state = optimizer.param_groups[0], optimizer.state[params[0]]
+    return {
+        "converged": grad_max <= group["tolerance_grad"],
+        "gradient_criterion_met": grad_max <= group["tolerance_grad"],
+        "max_gradient": grad_max,
+        "tolerance_grad": group["tolerance_grad"],
+        "n_iter": state.get("n_iter", 0),
+        "func_evals": state.get("func_evals", 0),
+        "max_iter": max_iter,
+        "max_eval": group["max_eval"],
+        "mean_objective": final_loss,
+        "gradient_scope": "unconstrained_model_parameters",
+    }
 
 
 def _compute_posteriors(

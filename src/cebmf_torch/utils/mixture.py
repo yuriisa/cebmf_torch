@@ -1,4 +1,5 @@
 import math
+import operator
 
 import torch
 
@@ -297,7 +298,9 @@ def optimize_pi_logL_lbfgs(
     zero_threshold: float = 1e-6,
     *,
     pi_init: torch.Tensor | None = None,
-) -> torch.Tensor:
+    max_iter: int = 2000,
+    return_diagnostics: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, dict]:
     """Optimize mixture weights via L-BFGS with softmax reparameterisation.
 
     An alternative to :func:`optimize_pi_logL` (EM), with optional
@@ -323,6 +326,11 @@ def optimize_pi_logL_lbfgs(
         0.0 disables thresholding.
     pi_init : torch.Tensor or None
         Initial mixture weights on the current component grid.
+    max_iter : int
+        Maximum L-BFGS iterations. Zero evaluates the initial weights.
+    return_diagnostics : bool
+        Return weights and endpoint diagnostics when True. The gradient refers
+        to softmax logits before optional weight thresholding.
 
     Returns
     -------
@@ -331,6 +339,9 @@ def optimize_pi_logL_lbfgs(
     """
     assert logL.ndim == 2, "logL must be (n, K)"
     n, K = logL.shape
+    max_iter = operator.index(max_iter)
+    if max_iter < 0 or n == 0 or K == 0:
+        raise ValueError("max_iter must be nonnegative and logL must be nonempty.")
     device = logL.device
     dtype = logL.dtype
 
@@ -377,7 +388,7 @@ def optimize_pi_logL_lbfgs(
     optimizer = torch.optim.LBFGS(
         [z],
         lr=1.0,
-        max_iter=2000,
+        max_iter=max_iter,
         tolerance_grad=1e-8,
         tolerance_change=1e-10,
         history_size=10,
@@ -394,9 +405,31 @@ def optimize_pi_logL_lbfgs(
         dfdx = -(L_aug.T @ (w_aug / Lx))
         xg = dfdx * x
         z.grad = xg - x * xg.sum()
+        if not torch.isfinite(f) or not torch.isfinite(z.grad).all():
+            raise FloatingPointError("Mixture optimization objective or gradient is non-finite.")
         return f
 
     optimizer.step(closure)
+    if return_diagnostics:
+        closure()
+        # Convert the native augmented-row gradient to the mean-data scale.
+        objective_scale = (n + prior_minus_1[pen_idx].sum()).item() / n
+        grad_max = z.grad.abs().max().item() * objective_scale
+        group = optimizer.param_groups[0]
+        state = optimizer.state[z]
+        tolerance = group["tolerance_grad"] * objective_scale
+        diagnostics = {
+            "converged": grad_max <= tolerance,
+            "gradient_criterion_met": grad_max <= tolerance,
+            "max_gradient": grad_max,
+            "tolerance_grad": tolerance,
+            "n_iter": state.get("n_iter", 0),
+            "func_evals": state.get("func_evals", 0),
+            "max_iter": max_iter,
+            "max_eval": group["max_eval"],
+            "gradient_scope": "unthresholded_softmax_logits",
+            "zero_threshold": zero_threshold,
+        }
 
     with torch.no_grad():
         z_s = z - z.max()
@@ -407,4 +440,14 @@ def optimize_pi_logL_lbfgs(
         if s > 0:
             pi /= s
 
+    if return_diagnostics:
+        objective = -torch.logsumexp(logL_f64 + pi.log(), dim=1).sum() - mixture_log_penalty(pi, vec_pen)
+        diagnostics["mean_objective"] = objective.item() / n
+        # The simplex gap detects saturated softmax weights that can suppress
+        # logit gradients. It bounds suboptimality of this convex weight fit.
+        scores = L_aug.T @ (w_aug / (L_aug @ pi).clamp_min(1e-300))
+        diagnostics["simplex_kkt_gap"] = max(0.0, (scores.max() - scores @ pi).item() * objective_scale)
+        diagnostics["simplex_kkt_tolerance"] = 1e-6
+        diagnostics["converged"] &= diagnostics["simplex_kkt_gap"] <= diagnostics["simplex_kkt_tolerance"]
+        return pi.to(dtype), diagnostics
     return pi.to(dtype)

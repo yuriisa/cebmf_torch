@@ -8,6 +8,7 @@ from .cov_sharp_gb_prior import sharp_cgb_posterior_means
 from .emdn import emdn_posterior_means
 from .hmm import fit_ash_hmm, hmm_neg_posterior_means, hmm_pos_posterior_means, hmm_posterior_means
 from .lcash import lcash_posterior_means, po_lcash_posterior_means
+from .md_ash import md_ash_posterior_means, predict_md_ash
 from .spiked_emdn import spiked_emdn_posterior_means
 
 __all__ = [
@@ -20,6 +21,8 @@ __all__ = [
     "hmm_neg_posterior_means",
     "lcash_posterior_means",
     "po_lcash_posterior_means",
+    "md_ash_posterior_means",
+    "predict_md_ash",
     "sharp_2cgb_posterior_means",
     "sharp_cgb_posterior_means",
     "spiked_emdn_posterior_means",
